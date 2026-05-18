@@ -507,6 +507,26 @@ def _get_clim(arr: np.ndarray, meta: Dict[str, Any]) -> Tuple[float, float]:
     return float(vmin), float(vmax)
 
 
+def _wrap_longitude_view(
+    data: np.ndarray,
+    lons: np.ndarray,
+    tiles: int = 3,
+    period: float = 360.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Repeat the map horizontally so panning across longitude feels continuous."""
+    if tiles < 1:
+        return data, lons
+
+    half_span = tiles // 2
+    offsets = range(-half_span, half_span + 1)
+    wrapped_data = np.concatenate([data] * len(list(offsets)), axis=1)
+    wrapped_lons = np.concatenate([
+        lons + offset * period
+        for offset in range(-half_span, half_span + 1)
+    ])
+    return wrapped_data, wrapped_lons
+
+
 # ── Plot 1: 2-D Ocean Field Heatmap ──────────────────────────────────────────
 
 def create_field_map(
@@ -538,11 +558,12 @@ def create_field_map(
     arr  = _mask_fill(data)
     vmin, vmax = _get_clim(arr, meta)
     label, units, cmap = meta["label"], meta["units"], meta["cmap"]
+    wrapped_arr, wrapped_lons = _wrap_longitude_view(arr, lons)
 
     fig = go.Figure(
         go.Heatmap(
-            z=arr,
-            x=lons,
+            z=wrapped_arr,
+            x=wrapped_lons,
             y=lats,
             colorscale=cmap,
             zmin=vmin,
@@ -577,6 +598,8 @@ def create_field_map(
             showgrid=True, gridcolor="rgba(255,255,255,0.12)",
             tickformat=".1f", ticksuffix="°",
             color="#b0b0b0",
+            range=[float(lons[0]), float(lons[-1])],
+            fixedrange=False,
         ),
         yaxis=dict(
             title="Latitude (°)",
@@ -592,6 +615,7 @@ def create_field_map(
         font=dict(color="#e0e0e0"),
         margin=dict(l=70, r=20, t=90, b=65),
         height=520,
+        dragmode="pan",
     )
     return fig
 
@@ -848,11 +872,11 @@ def render_sidebar() -> Dict[str, Any]:
                     show_zonal_mean, show_histogram.
     """
     with st.sidebar:
-        st.markdown("## ⚙️ Controls")
+        st.markdown("## Controles")
         st.markdown("---")
 
         # ── Variable selector ─────────────────────────────────────────────
-        st.markdown("### 📊 Variable")
+        st.markdown("### Variable")
         variable = st.selectbox(
             "Ocean Variable",
             options=list(VARIABLE_META.keys()),
@@ -866,7 +890,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("---")
 
         # ── Time slider ───────────────────────────────────────────────────
-        st.markdown("### ⏱️ Time")
+        st.markdown("### Tiempo")
         timestep = st.slider(
             "Timestep",
             min_value=0,
@@ -883,7 +907,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("---")
 
         # ── Depth ─────────────────────────────────────────────────────────
-        st.markdown("### 🌊 Depth Level")
+        st.markdown("### Nivel de profundidad")
         depth = st.slider(
             "Depth Level",
             min_value=0,
@@ -897,7 +921,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("---")
 
         # ── Geographic region ─────────────────────────────────────────────
-        st.markdown("### 🗺️ Region")
+        st.markdown("### Región geográfica")
 
         preset_key = st.selectbox(
             "Quick Region",
@@ -928,16 +952,16 @@ def render_sidebar() -> Dict[str, Any]:
 
         # Sanity checks
         if lat_min >= lat_max:
-            st.error("⚠️ Lat Min must be less than Lat Max.")
+            st.error(" Lat Min must be less than Lat Max.")
             lat_min, lat_max = -90.0, 90.0
         if lon_min >= lon_max:
-            st.error("⚠️ Lon Min must be less than Lon Max.")
+            st.error(" Lon Min must be less than Lon Max.")
             lon_min, lon_max = -180.0, 180.0
 
         st.markdown("---")
 
         # ── Resolution ────────────────────────────────────────────────────
-        st.markdown("### 🔬 Resolution")
+        st.markdown("### Resolución de datos")
         quality_key = st.select_slider(
             "Data Quality",
             options=list(QUALITY_OPTIONS.keys()),
@@ -952,7 +976,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("---")
 
         # ── Additional plots ──────────────────────────────────────────────
-        st.markdown("### 📈 Additional Panels")
+        st.markdown("### Paneles adicionales")
         st.caption("Show extra visualisation panels below the main map.")
         show_zonal_mean = st.checkbox(
             "Zonal Mean Profile",
@@ -1013,13 +1037,13 @@ def render_status_banner(using_demo: bool, params: Dict[str, Any]) -> None:
     """Show a data-source banner (live data vs demo mode)."""
     if using_demo:
         st.info(
-            "⚠️ **Demo mode** — displaying synthetic data.  "
+            " **Demo mode** — displaying synthetic data.  "
             "Install `OpenVisus` (`pip install OpenVisus`) and ensure "
             "network access to the NSDF server for real NASA data."
         )
     else:
         st.success(
-            f"✅ **Live data** via OpenVisus / NSDF  ·  "
+            f" **Live data** via OpenVisus / NSDF  ·  "
             f"Variable: **{params['variable']}**  ·  "
             f"Quality: **{params['quality_key']}**  ·  "
             f"Timestep: **{params['timestep']}** "
