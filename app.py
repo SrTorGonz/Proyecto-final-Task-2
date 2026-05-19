@@ -100,6 +100,10 @@ DATASET_URLS: Dict[str, str] = {
     "w":     _NSDF_BASE + "mit_output/llc2160_w/llc2160_w.idx",
 }
 
+DATASET_FIELDS: Dict[str, str] = {
+    "Theta": "theta",
+}
+
 # Variable display metadata — label, units, default colour range, Plotly colorscale
 VARIABLE_META: Dict[str, Dict[str, Any]] = {
     "salt":  {"label": "Sea Surface Salinity",  "units": "g kg⁻¹", "cmap": "haline",  "vmin": 31.0,  "vmax": 38.0},
@@ -133,6 +137,12 @@ DEFAULT_QUALITY_KEY = "Fast (~256 px)"
 # Hard cap: never send more than this many pixels to the browser per axis.
 # Protects against OOM crashes regardless of quality setting.
 MAX_RENDER_PX: int = 800
+
+# Maximum number of points used in the temperature time-series panel.
+TEMP_SERIES_MAX_POINTS: int = 36
+
+# Temperature history pulls from cached Theta slices when available.
+TEMP_HISTORY_VARIABLE: str = "Theta"
 
 # Preset geographic regions  (lat_min, lat_max, lon_min, lon_max)
 GEO_PRESETS: Dict[str, Tuple[float, float, float, float]] = {
@@ -180,6 +190,18 @@ def _connect_dataset(variable: str) -> Optional[Any]:
     except Exception as exc:
         logging.warning("OpenVisus connection failed for '%s': %s", variable, exc)
         return None
+
+
+def _dataset_field_name(variable: str, db: Optional[Any] = None) -> str:
+    """Return the OpenVisus field name for a display variable key."""
+    if variable in DATASET_FIELDS:
+        return DATASET_FIELDS[variable]
+    if db is None:
+        db = _connect_dataset(variable)
+    try:
+        return db.getField().name if db is not None else variable
+    except Exception:
+        return variable
 
 
 
@@ -306,34 +328,12 @@ def fetch_ocean_slice(
         return None
 
     try:
-        # ── Step 1: get full logical box dimensions ──────────────────────
-        logic_box = db.getLogicBox()          # [[x0,y0,z0], [W,H,D]]
-        W = int(logic_box[1][0])              # full width  in pixels
-        H = int(logic_box[1][1])              # full height in pixels
-
-        # ── Step 2: convert normalised ranges to pixel indices ───────────
-        x0 = max(0,   int(x_range[0] * W))
-        x1 = min(W,   int(x_range[1] * W))
-        y0 = max(0,   int(y_range[0] * H))
-        y1 = min(H,   int(y_range[1] * H))
-
-        # Guard: ensure at least a 1-pixel wide box
-        if x1 <= x0:
-            x1 = min(x0 + 1, W)
-        if y1 <= y0:
-            y1 = min(y0 + 1, H)
-
-        # ── Step 3: depth slice as integer indices ───────────────────────
-        z_lo = int(depth)
-        z_hi = int(depth) + 1
-
-        # ── Step 4: read ONLY the requested spatial tile ─────────────────
+        field_name = _dataset_field_name(variable, db)
         raw = db.read(
-            time    = timestep,
-            quality = quality,
-            x       = [x0, x1],
-            y       = [y0, y1],
-            z       = [z_lo, z_hi],
+            time=timestep,
+            field=field_name,
+            quality=quality,
+            z=[depth, depth + 1],
         )
 
         if raw is None:
@@ -804,7 +804,7 @@ def render_plot_box(
 
     try:
         fig = entry["fn"](data, lats, lons, variable, title)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     except Exception:
         st.error(f"Rendering '{entry['label']}' failed.")
         st.code(traceback.format_exc())
@@ -1090,6 +1090,127 @@ def build_title(params: Dict[str, Any]) -> str:
     )
 
 
+def _sample_timesteps(max_points: int = TEMP_SERIES_MAX_POINTS) -> np.ndarray:
+    """Return evenly spaced timesteps across the full simulation timeline."""
+    return np.unique(np.linspace(0, LLC2160_TOTAL_TIMESTEPS - 1, num=max_points, dtype=int))
+
+
+def _disk_load_any_quality(variable: str, timestep: int, depth: int) -> Optional[np.ndarray]:
+    """Load the first cached slice found for a timestep, trying preferred qualities first."""
+    for quality in (QUALITY_OPTIONS[DEFAULT_QUALITY_KEY], -6, -4, -3):
+        arr = _disk_load(variable, timestep, depth, quality)
+        if arr is not None:
+            return arr
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_temperature_time_series(
+    depth: int,
+    quality: int,
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute the mean temperature series from cached Theta data, falling back to NSDF."""
+    timesteps = _sample_timesteps()
+    x_lo, _ = latlon_to_norm(lat_min, lon_min)
+    x_hi, _ = latlon_to_norm(lat_max, lon_max)
+    _, y_lo = latlon_to_norm(lat_min, lon_min)
+    _, y_hi = latlon_to_norm(lat_max, lon_max)
+    x_range: Tuple[float, float] = (min(x_lo, x_hi), max(x_lo, x_hi))
+    y_range: Tuple[float, float] = (min(y_lo, y_hi), max(y_lo, y_hi))
+
+    mean_values: List[float] = []
+    time_values: List[datetime.datetime] = []
+
+    for current_timestep in timesteps:
+        time_values.append(_T0 + datetime.timedelta(hours=int(current_timestep)))
+
+        temp_slice = _disk_load_any_quality(
+            TEMP_HISTORY_VARIABLE,
+            int(current_timestep),
+            depth,
+        )
+
+        if temp_slice is None and OPENVISUS_AVAILABLE:
+            temp_slice = fetch_ocean_slice(
+                variable=TEMP_HISTORY_VARIABLE,
+                timestep=int(current_timestep),
+                depth=depth,
+                quality=quality,
+                x_range=x_range,
+                y_range=y_range,
+            )
+
+        if temp_slice is None:
+            mean_values.append(float("nan"))
+            continue
+
+        temp_arr = _mask_fill(temp_slice)
+        valid = temp_arr[np.isfinite(temp_arr)]
+        mean_values.append(float(np.nanmean(valid)) if valid.size else float("nan"))
+
+    return np.array(time_values, dtype=object), np.array(mean_values, dtype=np.float32)
+
+
+def create_temperature_time_series(
+    times: np.ndarray,
+    values: np.ndarray,
+    title: str,
+) -> go.Figure:
+    """Line chart of mean temperature through time for the selected region."""
+    valid = np.isfinite(values)
+    times = times[valid]
+    values = values[valid]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=values,
+            mode="lines",
+            line=dict(color="#ff8a5b", width=4, shape="linear"),
+            name="Temperature trend",
+            hoverinfo="skip",
+            connectgaps=True,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=times,
+            y=values,
+            mode="markers",
+            marker=dict(size=6, color="#ff8a5b", line=dict(width=1, color="#1f232b")),
+            name="Temperature mean",
+            hovertemplate="Time: %{x}<br>Mean temperature: %{y:.4f} °C<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            x=0.5, xanchor="center", font=dict(size=12),
+        ),
+        xaxis=dict(
+            title="Time",
+            color="#b0b0b0",
+            tickformat="%Y-%m-%d<br>%H:%M",
+        ),
+        yaxis=dict(
+            title="Average temperature (°C)",
+            color="#b0b0b0",
+        ),
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font=dict(color="#e0e0e0"),
+        height=360,
+        margin=dict(l=70, r=20, t=55, b=70),
+    )
+    return fig
+
+
 # =============================================================================
 # SECTION 7 — MAIN APPLICATION
 # =============================================================================
@@ -1102,10 +1223,12 @@ def main() -> None:
     params = render_sidebar()
 
     # ── 2. Compute normalised coordinate ranges for OpenVisus ──────────────
-    x_lo, y_lo = latlon_to_norm(params["lat_min"], params["lon_min"])
-    x_hi, y_hi = latlon_to_norm(params["lat_max"], params["lon_max"])
-    x_range: Tuple[float, float] = (x_lo, x_hi)
-    y_range: Tuple[float, float] = (y_lo, y_hi)
+    x_lo, _ = latlon_to_norm(params["lat_min"], params["lon_min"])
+    x_hi, _ = latlon_to_norm(params["lat_max"], params["lon_max"])
+    _, y_lo = latlon_to_norm(params["lat_min"], params["lon_min"])
+    _, y_hi = latlon_to_norm(params["lat_max"], params["lon_max"])
+    x_range: Tuple[float, float] = (min(x_lo, x_hi), max(x_lo, x_hi))
+    y_range: Tuple[float, float] = (min(y_lo, y_hi), max(y_lo, y_hi))
 
     # ── 3. Fetch data ──────────────────────────────────────────────────────
     # Verificar si el dato esta en disco antes de mostrar spinner
@@ -1192,6 +1315,29 @@ def main() -> None:
         lons     = lons,
         variable = params["variable"],
         title    = title,
+    )
+
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(0,212,255,0.2);margin:10px 0 6px;'/>",
+        unsafe_allow_html=True,
+    )
+
+    temp_times, temp_means = fetch_temperature_time_series(
+        depth=params["depth"],
+        quality=params["quality"],
+        lat_min=params["lat_min"],
+        lat_max=params["lat_max"],
+        lon_min=params["lon_min"],
+        lon_max=params["lon_max"],
+    )
+    temp_title = (
+        "<b>Promedio de temperatura en el tiempo</b><br>"
+        f"<sup>Región actual · Profundidad {params['depth']} · "
+        f"{params['variable']}</sup>"
+    )
+    st.plotly_chart(
+        create_temperature_time_series(temp_times, temp_means, temp_title),
+        width="stretch",
     )
 
     # ── 8. Optional secondary panels (user-toggled in sidebar) ────────────
