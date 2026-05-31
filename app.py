@@ -984,25 +984,6 @@ def render_sidebar() -> Dict[str, Any]:
         )
         quality = QUALITY_OPTIONS[quality_key]
         st.markdown("---")
-
-        # ── Additional plots ──────────────────────────────────────────────
-        st.markdown("### Paneles adicionales")
-        st.caption("Show extra visualisation panels below the main map.")
-        show_zonal_mean = st.checkbox(
-            "Zonal Mean Profile",
-            value=False,
-            help=PLOT_REGISTRY["zonal_mean"]["description"],
-        )
-        show_histogram = st.checkbox(
-            "Value Histogram",
-            value=False,
-            help=PLOT_REGISTRY["histogram"]["description"],
-        )
-        # ── TO ADD A NEW PANEL ─────────────────────────────────────────
-        # show_my_plot = st.checkbox("My New Plot", value=False,
-        #     help=PLOT_REGISTRY["my_plot"]["description"])
-
-        st.markdown("---")
         st.markdown("### 💾 Cache local")
         try:
             _files = [f for f in os.listdir(_SLICE_DIR) if f.endswith(".npz")]
@@ -1037,8 +1018,8 @@ def render_sidebar() -> Dict[str, Any]:
             "lon_max":         float(lon_max),
             "quality":         int(quality),
             "quality_key":     quality_key,
-            "show_zonal_mean": show_zonal_mean,
-            "show_histogram":  show_histogram,
+            "show_zonal_mean": False,
+            "show_histogram":  False,
             "geos_face":       int(geos_face),
             # Extend here for additional panel flags
         }
