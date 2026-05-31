@@ -111,6 +111,10 @@ VARIABLE_META: Dict[str, Dict[str, Any]] = {
     "u":     {"label": "Zonal Velocity (ARCO)", "units": "m/s",    "cmap": "balance", "vmin": -1.5,  "vmax": 1.5},
     "v":     {"label": "Meridional Velocity",   "units": "m/s",    "cmap": "balance", "vmin": -1.5,  "vmax": 1.5},
     "w":     {"label": "Vertical Velocity",     "units": "m/s",    "cmap": "delta",   "vmin": -0.01, "vmax": 0.01},
+    "GEOS_U": {"label": "GEOS Eastward Wind (U)",  "units": "m/s",  "cmap": "balance", "vmin": -40.0, "vmax": 40.0},
+    "GEOS_V": {"label": "GEOS Northward Wind (V)", "units": "m/s",  "cmap": "balance", "vmin": -40.0, "vmax": 40.0},
+    "GEOS_P": {"label": "GEOS Mid-level Pressure (P)", "units": "hPa", "cmap": "turbo",   "vmin": 50.0,  "vmax": 1050.0},
+    "GEOS_T": {"label": "GEOS Air Temperature (T)",    "units": "K",   "cmap": "thermal", "vmin": 180.0, "vmax": 310.0},
 }
 
 # LLC2160 dataset physical constants
@@ -163,18 +167,18 @@ GEO_PRESETS: Dict[str, Tuple[float, float, float, float]] = {
 # =============================================================================
 
 @st.cache_resource(show_spinner=False)
-def _connect_dataset(variable: str) -> Optional[Any]:
+def _connect_dataset(variable: str, face: int = 0) -> Optional[Any]:
     """
-    Open a persistent OpenVisus connection for a given ocean variable.
+    Open a persistent OpenVisus connection for a given variable.
 
-    Cached as a Streamlit resource (one connection object per variable per
-    process lifetime). Returns None when OpenVisus is unavailable or the
-    remote dataset cannot be reached.
+    Cached as a Streamlit resource.
 
     Parameters
     ----------
     variable : str
-        Ocean field name (key in DATASET_URLS).
+        Field name.
+    face : int
+        GEOS face index (0-5), ignored for LLC2160 ocean variables.
 
     Returns
     -------
@@ -182,22 +186,28 @@ def _connect_dataset(variable: str) -> Optional[Any]:
     """
     if not OPENVISUS_AVAILABLE:
         return None
-    url = DATASET_URLS.get(variable)
+    
+    if variable.startswith("GEOS_"):
+        var_char = variable.split("_")[1].lower()  # 'u', 'v', 'p', 't'
+        url = f"https://nsdf-climate3-origin.nationalresearchplatform.org:50098/nasa/nsdf/climate3/dyamond/GEOS/GEOS_{var_char.upper()}/{var_char}_face_{face}_depth_52_time_0_10269.idx"
+    else:
+        url = DATASET_URLS.get(variable)
+        
     if not url:
         return None
     try:
         return ov.LoadDataset(url)
     except Exception as exc:
-        logging.warning("OpenVisus connection failed for '%s': %s", variable, exc)
+        logging.warning("OpenVisus connection failed for '%s' (face %d): %s", variable, face, exc)
         return None
 
 
-def _dataset_field_name(variable: str, db: Optional[Any] = None) -> str:
+def _dataset_field_name(variable: str, db: Optional[Any] = None, face: int = 0) -> str:
     """Return the OpenVisus field name for a display variable key."""
     if variable in DATASET_FIELDS:
         return DATASET_FIELDS[variable]
     if db is None:
-        db = _connect_dataset(variable)
+        db = _connect_dataset(variable, face)
     try:
         return db.getField().name if db is not None else variable
     except Exception:
@@ -210,15 +220,17 @@ def _dataset_field_name(variable: str, db: Optional[Any] = None) -> str:
 # Generado por download_data.py. La clave es simple (no usa hash de floats).
 # =============================================================================
 
-def _slice_filename(variable: str, timestep: int, depth: int, quality: int) -> str:
+def _slice_filename(variable: str, timestep: int, depth: int, quality: int, face: int = 0) -> str:
     """Nombre de archivo — DEBE coincidir con download_data.py."""
+    if variable.startswith("GEOS_"):
+        return f"{variable}_face{face}_t{timestep:05d}_d{depth}_q{quality}_global.npz"
     return f"{variable}_t{timestep:05d}_d{depth}_q{quality}_global.npz"
 
 
 def _disk_load(variable: str, timestep: int, depth: int,
-               quality: int) -> Optional[np.ndarray]:
+               quality: int, face: int = 0) -> Optional[np.ndarray]:
     """Carga un slice global del disco. None si no existe."""
-    path = os.path.join(_SLICE_DIR, _slice_filename(variable, timestep, depth, quality))
+    path = os.path.join(_SLICE_DIR, _slice_filename(variable, timestep, depth, quality, face))
     if not os.path.exists(path):
         return None
     try:
@@ -233,9 +245,9 @@ def _disk_load(variable: str, timestep: int, depth: int,
 
 
 def _disk_save(variable: str, timestep: int, depth: int,
-               quality: int, arr: np.ndarray) -> None:
+               quality: int, arr: np.ndarray, face: int = 0) -> None:
     """Guarda un slice en disco (escritura atomica)."""
-    path = os.path.join(_SLICE_DIR, _slice_filename(variable, timestep, depth, quality))
+    path = os.path.join(_SLICE_DIR, _slice_filename(variable, timestep, depth, quality, face))
     if os.path.exists(path):
         return
     tmp = path + ".tmp.npz"
@@ -276,45 +288,15 @@ def fetch_ocean_slice(
     quality:   int,
     x_range:   Tuple[float, float],   # normalised lon range [0,1]
     y_range:   Tuple[float, float],   # normalised lat range [0,1]
+    face:      int = 0,
 ) -> Optional[np.ndarray]:
     """
-    Download a 2-D horizontal ocean field slice from the LLC2160 dataset.
-
-    KEY FIX — spatial subsetting to prevent OOM crashes
-    ────────────────────────────────────────────────────
-    Calling db.read() without spatial bounds downloads the entire grid
-    (~17 280 × 12 960 px at full resolution) which easily consumes several
-    GB of RAM and kills the browser tab.
-
-    Instead we:
-      1. Query db.getLogicBox() to learn the full pixel dimensions (W × H).
-      2. Convert the normalised lat/lon ranges to pixel coordinates.
-      3. Pass x=[x0,x1], y=[y0,y1] to db.read() — OpenVisus will stream
-         ONLY the requested tile, not the whole dataset.
-      4. After reading, apply a hard pixel cap (MAX_RENDER_PX) by downsampling
-         with numpy stride slicing to ensure Plotly never gets a grid larger
-         than ~800×800 px regardless of quality level.
-
-    Parameters
-    ----------
-    variable  : Ocean field name, e.g. 'salt'.
-    timestep  : Integer time index (0 … LLC2160_TOTAL_TIMESTEPS-1).
-    depth     : Depth level index (0 = sea surface).
-    quality   : OpenVisus resolution level (-6 = coarsest, -3 = good).
-    x_range   : Normalised (lon_min, lon_max) in [0, 1].
-    y_range   : Normalised (lat_min, lat_max) in [0, 1].
-
-    Returns
-    -------
-    2-D float32 numpy array [ny, nx], or None on failure.
+    Download a 2-D horizontal slice from the dataset.
     """
-    # ── Capa 1: disco-cache (pre-descargado por download_data.py) ──────────
-    # Clave simple: solo variable+timestep+depth+quality, SIN region.
-    # El slice global se recorta en memoria con _crop_to_region().
-    _global = _disk_load(variable, timestep, depth, quality)
+    # ── Capa 1: disco-cache 
+    _global = _disk_load(variable, timestep, depth, quality, face)
     if _global is not None:
         arr = _crop_to_region(_global, x_range, y_range)
-        # Aplicar cap de pixeles igual que en la descarga por red
         ny, nx = arr.shape
         sy = max(1, ny // MAX_RENDER_PX)
         sx = max(1, nx // MAX_RENDER_PX)
@@ -322,13 +304,13 @@ def fetch_ocean_slice(
             arr = arr[::sy, ::sx]
         return arr
 
-    # ── Capa 2: descarga en tiempo real (fallback cuando no hay cache) ──────
-    db = _connect_dataset(variable)
+    # ── Capa 2: descarga en tiempo real
+    db = _connect_dataset(variable, face)
     if db is None:
         return None
 
     try:
-        field_name = _dataset_field_name(variable, db)
+        field_name = _dataset_field_name(variable, db, face)
         raw = db.read(
             time=timestep,
             field=field_name,
@@ -339,17 +321,12 @@ def fetch_ocean_slice(
         if raw is None:
             return None
 
-        # Squeeze to 2-D (remove singleton depth and any extra leading axes)
         arr = np.array(raw, dtype=np.float32)
         while arr.ndim > 2:
             arr = arr[0]
 
-        # ── Step 5: guardar en disco para futuras sesiones ──────────────
-        # Guardamos el array GLOBAL (antes del recorte de region) para que
-        # cualquier region posterior pueda reutilizarlo sin re-descargar.
-        _disk_save(variable, timestep, depth, quality, arr)
+        _disk_save(variable, timestep, depth, quality, arr, face)
 
-        # ── Step 6: recortar a la region pedida y aplicar cap de pixeles ─
         arr = _crop_to_region(arr, x_range, y_range)
         ny, nx = arr.shape
         stride_y = max(1, ny // MAX_RENDER_PX)
@@ -360,7 +337,7 @@ def fetch_ocean_slice(
         return arr
 
     except Exception as exc:
-        logging.warning("read failed (var=%s, t=%d): %s", variable, timestep, exc)
+        logging.warning("read failed (var=%s, face=%d, t=%d): %s", variable, face, timestep, exc)
         logging.debug(traceback.format_exc())
         return None
 
@@ -558,7 +535,28 @@ def create_field_map(
     arr  = _mask_fill(data)
     vmin, vmax = _get_clim(arr, meta)
     label, units, cmap = meta["label"], meta["units"], meta["cmap"]
-    wrapped_arr, wrapped_lons = _wrap_longitude_view(arr, lons)
+    
+    is_geos = variable.startswith("GEOS_")
+    
+    if is_geos:
+        wrapped_arr = arr
+        wrapped_lons = lons
+        x_title = "X (Face Relative)"
+        y_title = "Y (Face Relative)"
+        x_tick_suffix = ""
+        y_tick_suffix = ""
+        x_tick_format = "d"
+        y_tick_format = "d"
+        hover_xy = "X: %{x}<br>Y: %{y}<br>"
+    else:
+        wrapped_arr, wrapped_lons = _wrap_longitude_view(arr, lons)
+        x_title = "Longitude (°)"
+        y_title = "Latitude (°)"
+        x_tick_suffix = "°"
+        y_tick_suffix = "°"
+        x_tick_format = ".1f"
+        y_tick_format = ".1f"
+        hover_xy = "Lon: %{x:.2f}°<br>Lat: %{y:.2f}°<br>"
 
     fig = go.Figure(
         go.Heatmap(
@@ -579,8 +577,7 @@ def create_field_map(
                 thickness=18,
             ),
             hovertemplate=(
-                "Lon: %{x:.2f}°<br>"
-                "Lat: %{y:.2f}°<br>"
+                hover_xy +
                 f"{label}: %{{z:.4f}} {units}"
                 "<extra></extra>"
             ),
@@ -594,20 +591,20 @@ def create_field_map(
             font=dict(size=13, color="#e0e0e0"),
         ),
         xaxis=dict(
-            title="Longitude (°)",
+            title=x_title,
             showgrid=True, gridcolor="rgba(255,255,255,0.12)",
-            tickformat=".1f", ticksuffix="°",
+            tickformat=x_tick_format, ticksuffix=x_tick_suffix,
             color="#b0b0b0",
             range=[float(lons[0]), float(lons[-1])],
             fixedrange=False,
         ),
         yaxis=dict(
-            title="Latitude (°)",
+            title=y_title,
             showgrid=True, gridcolor="rgba(255,255,255,0.12)",
-            tickformat=".1f", ticksuffix="°",
+            tickformat=y_tick_format, ticksuffix=y_tick_suffix,
             color="#b0b0b0",
             # Keep equal aspect only when displaying the full globe
-            scaleanchor="x" if (lons[-1] - lons[0]) > 270 else None,
+            scaleanchor="x" if (not is_geos and (lons[-1] - lons[0]) > 270) else None,
             scaleratio=1.0,
         ),
         plot_bgcolor="#0e1117",
@@ -878,28 +875,40 @@ def render_sidebar() -> Dict[str, Any]:
         # ── Variable selector ─────────────────────────────────────────────
         st.markdown("### Variable")
         variable = st.selectbox(
-            "Ocean Variable",
+            "Variable",
             options=list(VARIABLE_META.keys()),
             format_func=lambda k: f"{k} — {VARIABLE_META[k]['label']}",
             help=(
-                "Select the ocean field to visualise. "
-                "All variables are from the LLC2160 dataset. "
-                "Additional variables can be added in DATASET_URLS."
+                "Select the field to visualise. "
+                "Ocean variables are from the LLC2160 dataset, "
+                "and atmospheric variables are from the GEOS dataset."
             ),
         )
         st.markdown("---")
 
+        is_geos = variable.startswith("GEOS_")
+        geos_face = 0
+        if is_geos:
+            st.markdown("### Proyección GEOS")
+            geos_face = st.selectbox(
+                "Cara (Face)",
+                options=[0, 1, 2, 3, 4, 5],
+                index=0,
+                help="GEOS Atmospheric data is projected on a cubed sphere with 6 faces (0-5).",
+            )
+            st.markdown("---")
+
         # ── Time slider ───────────────────────────────────────────────────
         st.markdown("### Tiempo")
+        max_time = 10269 if is_geos else (LLC2160_TOTAL_TIMESTEPS - 1)
         timestep = st.slider(
             "Timestep",
             min_value=0,
-            max_value=LLC2160_TOTAL_TIMESTEPS - 1,
+            max_value=max_time,
             value=0,
             step=1,
             help=(
-                f"Timestep 0 → {LLC2160_TOTAL_TIMESTEPS-1} "
-                "(hourly from 2020-01-20). "
+                f"Timestep 0 → {max_time}. "
                 "The heatmap updates automatically."
             ),
         )
@@ -908,15 +917,16 @@ def render_sidebar() -> Dict[str, Any]:
 
         # ── Depth ─────────────────────────────────────────────────────────
         st.markdown("### Nivel de profundidad")
+        max_depth = 51 if is_geos else (LLC2160_DEPTH_LEVELS - 1)
         depth = st.slider(
             "Depth Level",
             min_value=0,
-            max_value=LLC2160_DEPTH_LEVELS - 1,
+            max_value=max_depth,
             value=0,
             step=1,
-            help="0 = sea surface. The LLC2160 model has 90 vertical levels.",
+            help=f"0 = surface. GEOS has 52 levels (0-51), LLC2160 has 90 levels (0-89).",
         )
-        depth_lbl = "Sea Surface" if depth == 0 else f"Level {depth} (≈ {depth * 50} m)"
+        depth_lbl = "Surface" if depth == 0 else f"Level {depth} (≈ {depth * 50} m)"
         st.caption(f"Selected: **{depth_lbl}**")
         st.markdown("---")
 
@@ -1029,6 +1039,7 @@ def render_sidebar() -> Dict[str, Any]:
             "quality_key":     quality_key,
             "show_zonal_mean": show_zonal_mean,
             "show_histogram":  show_histogram,
+            "geos_face":       int(geos_face),
             # Extend here for additional panel flags
         }
 
@@ -1095,10 +1106,10 @@ def _sample_timesteps(max_points: int = TEMP_SERIES_MAX_POINTS) -> np.ndarray:
     return np.unique(np.linspace(0, LLC2160_TOTAL_TIMESTEPS - 1, num=max_points, dtype=int))
 
 
-def _disk_load_any_quality(variable: str, timestep: int, depth: int) -> Optional[np.ndarray]:
+def _disk_load_any_quality(variable: str, timestep: int, depth: int, face: int = 0) -> Optional[np.ndarray]:
     """Load the first cached slice found for a timestep, trying preferred qualities first."""
     for quality in (QUALITY_OPTIONS[DEFAULT_QUALITY_KEY], -6, -4, -3):
-        arr = _disk_load(variable, timestep, depth, quality)
+        arr = _disk_load(variable, timestep, depth, quality, face)
         if arr is not None:
             return arr
     return None
@@ -1112,9 +1123,14 @@ def fetch_temperature_time_series(
     lat_max: float,
     lon_min: float,
     lon_max: float,
+    variable: str = "Theta",
+    face: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute the mean temperature series from cached Theta data, falling back to NSDF."""
-    timesteps = _sample_timesteps()
+    """Compute the mean value series for the selected variable through time, falling back to NSDF."""
+    # Use variable-specific max timesteps
+    max_t = 10270 if variable.startswith("GEOS_") else LLC2160_TOTAL_TIMESTEPS
+    timesteps = np.unique(np.linspace(0, max_t - 1, num=TEMP_SERIES_MAX_POINTS, dtype=int))
+    
     x_lo, _ = latlon_to_norm(lat_min, lon_min)
     x_hi, _ = latlon_to_norm(lat_max, lon_max)
     _, y_lo = latlon_to_norm(lat_min, lon_min)
@@ -1129,19 +1145,21 @@ def fetch_temperature_time_series(
         time_values.append(_T0 + datetime.timedelta(hours=int(current_timestep)))
 
         temp_slice = _disk_load_any_quality(
-            TEMP_HISTORY_VARIABLE,
+            variable,
             int(current_timestep),
             depth,
+            face,
         )
 
         if temp_slice is None and OPENVISUS_AVAILABLE:
             temp_slice = fetch_ocean_slice(
-                variable=TEMP_HISTORY_VARIABLE,
+                variable=variable,
                 timestep=int(current_timestep),
                 depth=depth,
                 quality=quality,
                 x_range=x_range,
                 y_range=y_range,
+                face=face,
             )
 
         if temp_slice is None:
@@ -1159,11 +1177,16 @@ def create_temperature_time_series(
     times: np.ndarray,
     values: np.ndarray,
     title: str,
+    variable: str = "Theta",
 ) -> go.Figure:
-    """Line chart of mean temperature through time for the selected region."""
+    """Line chart of mean variable value through time for the selected region."""
     valid = np.isfinite(values)
     times = times[valid]
     values = values[valid]
+
+    meta = VARIABLE_META.get(variable, {})
+    label = meta.get("label", variable)
+    units = meta.get("units", "")
 
     fig = go.Figure()
     fig.add_trace(
@@ -1172,7 +1195,7 @@ def create_temperature_time_series(
             y=values,
             mode="lines",
             line=dict(color="#ff8a5b", width=4, shape="linear"),
-            name="Temperature trend",
+            name=f"{label} Trend",
             hoverinfo="skip",
             connectgaps=True,
         )
@@ -1183,8 +1206,8 @@ def create_temperature_time_series(
             y=values,
             mode="markers",
             marker=dict(size=6, color="#ff8a5b", line=dict(width=1, color="#1f232b")),
-            name="Temperature mean",
-            hovertemplate="Time: %{x}<br>Mean temperature: %{y:.4f} °C<extra></extra>",
+            name=f"{label} Mean",
+            hovertemplate=f"Time: %{{x}}<br>Mean {label}: %{{y:.4f}} {units}<extra></extra>",
         )
     )
 
@@ -1199,7 +1222,7 @@ def create_temperature_time_series(
             tickformat="%Y-%m-%d<br>%H:%M",
         ),
         yaxis=dict(
-            title="Average temperature (°C)",
+            title=f"Average {label} ({units})",
             color="#b0b0b0",
         ),
         plot_bgcolor="#0e1117",
@@ -1234,7 +1257,8 @@ def main() -> None:
     # Verificar si el dato esta en disco antes de mostrar spinner
     _key_fname = _slice_filename(
         params["variable"], params["timestep"],
-        params["depth"], params["quality"]
+        params["depth"], params["quality"],
+        face=params.get("geos_face", 0)
     )
     _is_cached = os.path.exists(os.path.join(_SLICE_DIR, _key_fname))
     _spinner_msg = (
@@ -1251,7 +1275,7 @@ def main() -> None:
             _conn_error = "OpenVisus not installed — run: `pip install OpenVisus`"
         else:
             # Test the dataset connection first so we can report a clear error
-            _db = _connect_dataset(params["variable"])
+            _db = _connect_dataset(params["variable"], face=params.get("geos_face", 0))
             if _db is None:
                 _conn_error = (
                     f"Could not connect to NSDF server for variable "
@@ -1268,6 +1292,7 @@ def main() -> None:
                     quality   = params["quality"],
                     x_range   = x_range,
                     y_range   = y_range,
+                    face      = params.get("geos_face", 0),
                 )
                 if data is None:
                     _conn_error = (
@@ -1329,14 +1354,16 @@ def main() -> None:
         lat_max=params["lat_max"],
         lon_min=params["lon_min"],
         lon_max=params["lon_max"],
+        variable="Theta",
+        face=0,
     )
+    
     temp_title = (
         "<b>Promedio de temperatura en el tiempo</b><br>"
-        f"<sup>Región actual · Profundidad {params['depth']} · "
-        f"{params['variable']}</sup>"
+        f"<sup>Región actual · Profundidad {params['depth']} · Theta</sup>"
     )
     st.plotly_chart(
-        create_temperature_time_series(temp_times, temp_means, temp_title),
+        create_temperature_time_series(temp_times, temp_means, temp_title, variable="Theta"),
         width="stretch",
     )
 
