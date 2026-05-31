@@ -54,6 +54,12 @@ try:
 except ImportError:
     OPENVISUS_AVAILABLE = False
 
+try:
+    from global_land_mask import globe  # pip install global-land-mask
+    GLOBAL_LAND_MASK_AVAILABLE = True
+except ImportError:
+    GLOBAL_LAND_MASK_AVAILABLE = False
+
 logging.basicConfig(level=logging.WARNING)
 
 # =============================================================================
@@ -405,8 +411,44 @@ def _generate_demo_slice(
             + 0.4 * np.random.randn(n, n)
         )
 
+    elif variable == "GEOS_U":
+        # Eastward wind: trade winds negative near equator, westerlies positive mid-lat
+        data = (
+            -8.0 * np.cos(np.radians(LAT * 3.0))
+            + 12.0 * np.sin(np.radians(LAT * 2.0))
+            + 4.0  * np.sin(np.radians(LON * 0.5) + phase)
+            + 3.0  * np.cos(np.radians(LON + LAT) + phase)
+            + 1.5  * np.random.randn(n, n)
+        )
+
+    elif variable == "GEOS_V":
+        # Northward wind: meridional Hadley/Rossby component
+        data = (
+            3.0  * np.sin(np.radians(LON * 1.0) + phase)
+            + 4.0  * np.cos(np.radians(LON * 0.7 + LAT))
+            - 2.0  * np.sin(np.radians(LAT * 4.0))
+            + 1.0  * np.random.randn(n, n)
+        )
+
+    elif variable == "u":
+        # Ocean zonal current: gyre structure
+        data = (
+            0.6  * np.cos(np.radians(LAT * 2.5))
+            + 0.25 * np.sin(np.radians(LON * 0.8) + phase)
+            + 0.12 * np.cos(np.radians(LON + LAT * 1.5))
+            + 0.05 * np.random.randn(n, n)
+        )
+
+    elif variable == "v":
+        # Ocean meridional current: boundary current structure
+        data = (
+            0.25 * np.sin(np.radians(LON * 1.0) + phase)
+            + 0.18 * np.cos(np.radians(LON * 0.5 + LAT * 2.0))
+            + 0.04 * np.random.randn(n, n)
+        )
+
     else:
-        # Generic diverging field (velocities, pressure)
+        # Generic diverging field (pressure, etc.)
         mid = (vmin + vmax) / 2.0
         amp = (vmax - vmin) / 4.0
         data = (
@@ -748,6 +790,354 @@ def create_histogram(
 # ── PLOT REGISTRY ─────────────────────────────────────────────────────────────
 # Maps string keys → callable plot factories with uniform signature:
 #   fn(data, lats, lons, variable, title) -> go.Figure
+
+def _sample_vector_field(
+    east: np.ndarray,
+    north: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    stride: int = 7,
+    polar_stride: int = 12,
+    ocean_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return sparse lon/lat/vector arrays suitable for a readable quiver layer."""
+    east_arr = _mask_fill(east)
+    north_arr = _mask_fill(north)
+    rows, cols = east_arr.shape
+
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    row_grid, col_grid = np.meshgrid(
+        np.arange(rows),
+        np.arange(cols),
+        indexing="ij",
+    )
+
+    valid = np.isfinite(east_arr) & np.isfinite(north_arr)
+
+    if ocean_mask is not None:
+        valid &= ocean_mask
+
+    standard_keep = (row_grid % stride == 0) & (col_grid % stride == 0)
+    polar_keep = (row_grid % polar_stride == 0) & (col_grid % polar_stride == 0)
+    valid &= np.where(np.abs(lat_grid) > 55.0, polar_keep, standard_keep)
+
+    return (
+        lon_grid[valid].ravel(),
+        lat_grid[valid].ravel(),
+        east_arr[valid].ravel(),
+        north_arr[valid].ravel(),
+    )
+
+
+def _vector_arrow_traces(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    east: np.ndarray,
+    north: np.ndarray,
+    *,
+    name: str,
+    color: str,
+    arrow_length_degrees: float,
+    line_color: str,
+    ocean_only: bool = False,
+    line_width: float = 1.5,
+) -> Tuple[go.Scattergeo, go.Scattergeo, float]:
+    """Draw geographic vectors as shaft segments plus arrowhead markers."""
+    magnitude = np.sqrt(east ** 2 + north ** 2)
+    valid = np.isfinite(lon) & np.isfinite(lat) & np.isfinite(magnitude) & (magnitude > 0)
+    valid &= np.abs(lat) <= 80.0
+    if ocean_only and GLOBAL_LAND_MASK_AVAILABLE:
+        valid &= ~globe.is_land(lat, lon)
+
+    if not np.any(valid):
+        empty_lines = go.Scattergeo(
+            lon=[],
+            lat=[],
+            mode="lines",
+            line=dict(color=line_color, width=line_width),
+            name=name,
+            showlegend=False,
+            hoverinfo="skip",
+        )
+        empty_heads = go.Scattergeo(
+            lon=[],
+            lat=[],
+            mode="markers",
+            name=name,
+            showlegend=True,
+            hoverinfo="skip",
+        )
+        return empty_lines, empty_heads, 1.0
+
+    lon = lon[valid]
+    lat = lat[valid]
+    east = east[valid]
+    north = north[valid]
+    magnitude = magnitude[valid]
+
+    reference = float(np.nanpercentile(magnitude, 95))
+    if not np.isfinite(reference) or reference <= 0:
+        reference = 1.0
+
+    # Angle clockwise from North — correct bearing for Plotly angleref="up"
+    angle = np.degrees(np.arctan2(east, north))
+
+    # Log-scale visual length: makes slow ocean currents AND fast winds both legible
+    visual_ratio = np.log1p(magnitude) / np.log1p(reference)
+    visual_ratio = np.clip(visual_ratio, 0.15, 1.0)  # min 15% so tiny vectors still show
+    length_degrees = arrow_length_degrees * visual_ratio
+
+    angle_rad = np.radians(angle)
+    lon_tip = lon + np.sin(angle_rad) * length_degrees
+    lat_tip = lat + np.cos(angle_rad) * length_degrees
+
+    # Arrowhead size: SMALL and fixed — 7px base, 10px max.
+    # Variable size was causing the bloated triangle look.
+    head_size = (5.0 + 5.0 * visual_ratio).clip(5.0, 10.0)
+
+    in_bounds = (lon_tip >= -180.0) & (lon_tip <= 180.0) & (lat_tip >= -80.0) & (lat_tip <= 80.0)
+    if ocean_only and GLOBAL_LAND_MASK_AVAILABLE:
+        tip_is_ocean = np.zeros_like(in_bounds, dtype=bool)
+        tip_is_ocean[in_bounds] = ~globe.is_land(lat_tip[in_bounds], lon_tip[in_bounds])
+        in_bounds &= tip_is_ocean
+    lon = lon[in_bounds]
+    lat = lat[in_bounds]
+    lon_tip = lon_tip[in_bounds]
+    lat_tip = lat_tip[in_bounds]
+    angle = angle[in_bounds]
+    head_size = head_size[in_bounds]
+
+    # Build shaft segments (tail → tip, separated by None for gap between arrows)
+    lons_seg: List[Optional[float]] = []
+    lats_seg: List[Optional[float]] = []
+    for lo, la, lo2, la2 in zip(lon, lat, lon_tip, lat_tip):
+        lons_seg.extend([float(lo), float(lo2), None])
+        lats_seg.extend([float(la), float(la2), None])
+
+    line_trace = go.Scattergeo(
+        lon=lons_seg,
+        lat=lats_seg,
+        mode="lines",
+        line=dict(color=line_color, width=1.2),
+        name=f"{name} shafts",
+        showlegend=False,
+        hoverinfo="skip",
+    )
+    head_trace = go.Scattergeo(
+        lon=lon_tip,
+        lat=lat_tip,
+        mode="markers",
+        marker=dict(
+            symbol="arrow",
+            size=head_size,
+            color=color,
+            angleref="up",
+            angle=angle,
+            line=dict(width=0),   # no border on arrowhead — cleaner look
+        ),
+        name=f"{name} · P95={reference:.1f}m/s",
+        showlegend=True,
+        hoverinfo="skip",
+    )
+    return line_trace, head_trace, reference
+
+
+def _resize_nearest(arr: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    """Resize a 2-D array with nearest-neighbour indexing for vector overlays."""
+    rows, cols = arr.shape
+    target_rows, target_cols = shape
+    row_idx = np.linspace(0, rows - 1, target_rows, dtype=int)
+    col_idx = np.linspace(0, cols - 1, target_cols, dtype=int)
+    return arr[np.ix_(row_idx, col_idx)]
+
+
+def _build_ocean_mask(mask_source: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    """Create a simple ocean-validity mask from Theta/salt-style data."""
+    source = _resize_nearest(_mask_fill(mask_source), shape)
+    return np.isfinite(source) & (np.abs(source) > 1e-12)
+
+
+def create_wind_current_quiver(
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    current_u: np.ndarray,
+    current_v: np.ndarray,
+    ocean_mask_source: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    params: Dict[str, Any],
+) -> go.Figure:
+    """
+    Quiver map of GEOS winds overlaid with LLC2160 ocean currents.
+
+    Wind arrows are blue and current arrows are orange, making wind-driven
+    circulation and Ekman transport easier to inspect directly.
+    """
+    # ── Determine target grid resolution ──────────────────────────────────────
+    # Cap at 128×256 for a global view — enough detail without OOM.
+    # For regional views (small domain) use the natural data resolution.
+    lat_span = params["lat_max"] - params["lat_min"]
+    lon_span = (params["lon_max"] - params["lon_min"]) % 360 or 360
+    is_global = lat_span > 140 and lon_span > 330
+    max_rows = 128 if is_global else 160
+    max_cols = 256 if is_global else 320
+
+    target_shape = (
+        min(wind_u.shape[0], wind_v.shape[0], current_u.shape[0], current_v.shape[0], ocean_mask_source.shape[0]),
+        min(wind_u.shape[1], wind_v.shape[1], current_u.shape[1], current_v.shape[1], ocean_mask_source.shape[1]),
+    )
+    target_shape = (min(target_shape[0], max_rows), min(target_shape[1], max_cols))
+
+    wind_u = _resize_nearest(wind_u, target_shape)
+    wind_v = _resize_nearest(wind_v, target_shape)
+    current_u = _resize_nearest(current_u, target_shape)
+    current_v = _resize_nearest(current_v, target_shape)
+    ocean_mask = _build_ocean_mask(ocean_mask_source, target_shape)
+    lats, lons = make_axes(
+        params["lat_min"], params["lat_max"],
+        params["lon_min"], params["lon_max"],
+        target_shape[0], target_shape[1],
+    )
+
+    # ── Stride: fewer points = cleaner arrows, no overlap ─────────────────────
+    # Global: stride=8 → ~16×32 ≈ 512 wind arrows — readable, not crowded.
+    # Regional: stride=5 for more spatial detail.
+    base_stride = 8 if is_global else 5
+    polar_stride = 14 if is_global else 9
+
+    wx, wy, wu, wv = _sample_vector_field(
+        wind_u,
+        wind_v,
+        lats,
+        lons,
+        stride=base_stride,
+        polar_stride=polar_stride,
+    )
+    cx, cy, cu, cv = _sample_vector_field(
+        current_u,
+        current_v,
+        lats,
+        lons,
+        stride=base_stride + 1,
+        polar_stride=polar_stride,
+        ocean_mask=ocean_mask,
+    )
+
+    # ── Arrow length in geographic degrees ────────────────────────────────────
+    # Rule of thumb: one arrow should span roughly one grid cell width so
+    # adjacent arrows don't overlap.  Grid cell ≈ lon_span / num_cols.
+    grid_cell_deg = lon_span / target_shape[1]
+    # Wind arrows: slightly longer than one cell; currents: slightly shorter.
+    wind_arrow_deg  = max(4.0, grid_cell_deg * base_stride * 0.85)
+    ocean_arrow_deg = max(3.5, grid_cell_deg * (base_stride + 1) * 0.75)
+
+    wind_lines, wind_heads, wind_ref = _vector_arrow_traces(
+        wx,
+        wy,
+        wu,
+        wv,
+        name="Vientos GEOS (U,V)",
+        color="#4da6ff",
+        line_color="rgba(77,166,255,0.55)",
+        arrow_length_degrees=wind_arrow_deg,
+    )
+    current_lines, current_heads, current_ref = _vector_arrow_traces(
+        cx,
+        cy,
+        cu,
+        cv,
+        name="Corrientes LLC2160 (u,v)",
+        color="#ff8c42",
+        line_color="rgba(255,140,66,0.6)",
+        arrow_length_degrees=ocean_arrow_deg,
+        ocean_only=True,
+    )
+
+    fig = go.Figure(data=[wind_lines, current_lines, wind_heads, current_heads])
+
+    fig.update_geos(
+        projection_type="equirectangular",
+        lonaxis=dict(range=[-180, 180], showgrid=True,
+                     gridcolor="rgba(255,255,255,0.07)", dtick=30),
+        lataxis=dict(range=[-80, 80],  showgrid=True,
+                     gridcolor="rgba(255,255,255,0.07)", dtick=30),
+        showland=True,    landcolor="#252836",   # distinct grey-blue land
+        showocean=True,   oceancolor="#09152a",  # deep navy ocean
+        showlakes=True,   lakecolor="#09152a",
+        showrivers=False,
+        showcoastlines=True,  coastlinecolor="#6090b0", coastlinewidth=0.9,
+        showcountries=True,   countrycolor="#3a4a5c",   countrywidth=0.4,
+        showframe=True,  framecolor="rgba(90,127,160,0.35)",
+        bgcolor="#07101e",
+    )
+
+    # ── Reference scale bar inside map — South Atlantic, always ocean ────────
+    # Place at lon=-40, lat=-60 (South Atlantic — never land)
+    ref_lon_s, ref_lat_r = -40.0, -62.0
+    ref_lon_e = ref_lon_s + wind_arrow_deg
+    fig.add_trace(go.Scattergeo(
+        lon=[ref_lon_s, ref_lon_e, None], lat=[ref_lat_r, ref_lat_r, None],
+        mode="lines", line=dict(color="rgba(255,255,255,0.7)", width=2.5),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scattergeo(
+        lon=[ref_lon_e], lat=[ref_lat_r],
+        mode="markers",
+        marker=dict(symbol="arrow", size=9, color="white",
+                    angleref="up", angle=90, line=dict(width=0)),
+        showlegend=False, hoverinfo="skip",
+    ))
+    # Tick marks at start and end of scale bar
+    fig.add_trace(go.Scattergeo(
+        lon=[ref_lon_s, ref_lon_s, None, ref_lon_e, ref_lon_e, None],
+        lat=[ref_lat_r - 1.5, ref_lat_r + 1.5, None,
+             ref_lat_r - 1.5, ref_lat_r + 1.5, None],
+        mode="lines", line=dict(color="rgba(255,255,255,0.7)", width=1.5),
+        showlegend=False, hoverinfo="skip",
+    ))
+    # Label above scale bar
+    fig.add_trace(go.Scattergeo(
+        lon=[(ref_lon_s + ref_lon_e) / 2], lat=[ref_lat_r + 4.5],
+        mode="text",
+        text=[f"= {wind_ref:.0f} m/s"],
+        textfont=dict(size=10, color="white"),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>Dinámica de Vientos y Corrientes</b><br>"
+                "<sup>Vector Field: Vientos GEOS (U,V) + Corrientes LLC2160 (u,v)</sup>"
+            ),
+            x=0.5, xanchor="center",
+            font=dict(size=14, color="#dce8f0"),
+        ),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=0.03,
+            xanchor="center", x=0.5,
+            font=dict(size=11, color="#dce8f0"),
+            bgcolor="rgba(7,16,30,0.88)",
+            bordercolor="rgba(90,127,160,0.3)", borderwidth=1,
+        ),
+        annotations=[
+            dict(
+                text=(
+                    f"Escala log(P95) · 🔵 viento P95={wind_ref:.1f} m/s · "
+                    f"🟠 corriente P95={current_ref:.2f} m/s"
+                ),
+                x=0.5, y=-0.04, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=10, color="#8a9fb0"), align="center",
+            ),
+        ],
+        paper_bgcolor="#07101e",
+        plot_bgcolor="#07101e",
+        font=dict(color="#dce8f0"),
+        height=560,
+        margin=dict(l=0, r=0, t=60, b=45),
+    )
+    return fig
+
 
 PLOT_REGISTRY: Dict[str, Dict[str, Any]] = {
     "field_map": {
@@ -1349,6 +1739,88 @@ def main() -> None:
     )
 
     # ── 8. Optional secondary panels (user-toggled in sidebar) ────────────
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(0,212,255,0.2);margin:10px 0 6px;'/>",
+        unsafe_allow_html=True,
+    )
+    with st.spinner("Cargando vectores de viento y corrientes..."):
+        current_timestep = min(params["timestep"], LLC2160_TOTAL_TIMESTEPS - 1)
+        wind_depth = min(params["depth"], 51)
+
+        wind_u = fetch_ocean_slice(
+            variable="GEOS_U",
+            timestep=params["timestep"],
+            depth=wind_depth,
+            quality=params["quality"],
+            x_range=x_range,
+            y_range=y_range,
+            face=params.get("geos_face", 0),
+        )
+        wind_v = fetch_ocean_slice(
+            variable="GEOS_V",
+            timestep=params["timestep"],
+            depth=wind_depth,
+            quality=params["quality"],
+            x_range=x_range,
+            y_range=y_range,
+            face=params.get("geos_face", 0),
+        )
+        current_u = fetch_ocean_slice(
+            variable="u",
+            timestep=current_timestep,
+            depth=params["depth"],
+            quality=params["quality"],
+            x_range=x_range,
+            y_range=y_range,
+            face=0,
+        )
+        current_v = fetch_ocean_slice(
+            variable="v",
+            timestep=current_timestep,
+            depth=params["depth"],
+            quality=params["quality"],
+            x_range=x_range,
+            y_range=y_range,
+            face=0,
+        )
+        if params["variable"] in ("salt", "Theta"):
+            ocean_mask_source = data
+        else:
+            ocean_mask_source = fetch_ocean_slice(
+                variable="salt",
+                timestep=current_timestep,
+                depth=params["depth"],
+                quality=params["quality"],
+                x_range=x_range,
+                y_range=y_range,
+                face=0,
+            )
+
+        if wind_u is None:
+            wind_u = _generate_demo_slice("GEOS_U", params["timestep"], (params["lat_min"], params["lat_max"]), (params["lon_min"], params["lon_max"]))
+        if wind_v is None:
+            wind_v = _generate_demo_slice("GEOS_V", params["timestep"], (params["lat_min"], params["lat_max"]), (params["lon_min"], params["lon_max"]))
+        if current_u is None:
+            current_u = _generate_demo_slice("u", current_timestep, (params["lat_min"], params["lat_max"]), (params["lon_min"], params["lon_max"]))
+        if current_v is None:
+            current_v = _generate_demo_slice("v", current_timestep, (params["lat_min"], params["lat_max"]), (params["lon_min"], params["lon_max"]))
+        if ocean_mask_source is None:
+            ocean_mask_source = _generate_demo_slice("salt", current_timestep, (params["lat_min"], params["lat_max"]), (params["lon_min"], params["lon_max"]))
+
+    st.plotly_chart(
+        create_wind_current_quiver(
+            wind_u=wind_u,
+            wind_v=wind_v,
+            current_u=current_u,
+            current_v=current_v,
+            ocean_mask_source=ocean_mask_source,
+            lats=lats,
+            lons=lons,
+            params=params,
+        ),
+        width="stretch",
+    )
+
     secondary_panels: List[Tuple[bool, str]] = [
         (params["show_zonal_mean"], "zonal_mean"),
         (params["show_histogram"],  "histogram"),
