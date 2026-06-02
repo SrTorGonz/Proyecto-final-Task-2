@@ -930,6 +930,14 @@ def create_bubble_windstress(
     tau_flat  = tau_flat[mask]
     anom_flat = anom_flat[mask]
 
+    # ── Filtrar puntos sobre tierra ───────────────────────────────────────
+    if GLOBAL_LAND_MASK_AVAILABLE:
+        is_ocean = ~globe.is_land(lat_flat, lon_flat)
+        lat_flat  = lat_flat[is_ocean]
+        lon_flat  = lon_flat[is_ocean]
+        tau_flat  = tau_flat[is_ocean]
+        anom_flat = anom_flat[is_ocean]
+
     # ── Normalizar tamaño de burbuja (0–40 px) ────────────────────────────
     tau_norm = (tau_flat - tau_flat.min()) / (tau_flat.max() - tau_flat.min() + 1e-9)
     size_px  = 4 + tau_norm * 36   # min 4, max 40
