@@ -787,6 +787,69 @@ def create_histogram(
 # def create_time_comparison(data, lats, lons, variable, title):
 #     ...
 
+
+# ── Plot 5: Hovmöller Diagram ─────────────────────────────────────────────────
+
+def create_hovmoller(
+    data:     np.ndarray,
+    lats:     np.ndarray,
+    lons:     np.ndarray,   # noqa: ARG001
+    variable: str,
+    title:    str,          # noqa: ARG001
+) -> go.Figure:
+    """Hovmöller diagram: heatmap latitud × tiempo con la media zonal de la variable seleccionada."""
+    meta     = VARIABLE_META.get(variable, VARIABLE_META["salt"])
+    lat_step = 4
+
+    timesteps_to_try = list(range(0, 10))
+    frames: List[Optional[np.ndarray]] = []
+
+    for t in timesteps_to_try:
+        arr = _disk_load_any_quality(variable, t, 0, face=0)
+        if arr is None:
+            arr = _generate_demo_slice(
+                variable, t,
+                lat_range=(lats[0] if len(lats) > 0 else -90, lats[-1] if len(lats) > 0 else 90),
+                lon_range=(-180, 180),
+            )
+        arr_sub    = arr[::lat_step, :]
+        zonal_mean = np.nanmean(_mask_fill(arr_sub), axis=1)
+        frames.append(zonal_mean)
+
+    ref_len = max((len(f) for f in frames if f is not None), default=1)
+    frames  = [f if f is not None else np.full(ref_len, np.nan) for f in frames]
+
+    matrix      = np.column_stack(frames)
+    lat_indices = np.arange(matrix.shape[0]) * lat_step - 90
+    time_labels = [f"t={t}" for t in timesteps_to_try]
+    vmin, vmax  = _get_clim(matrix, meta)
+
+    fig = go.Figure(go.Heatmap(
+        z           = matrix,
+        x           = time_labels,
+        y           = lat_indices,
+        colorscale  = meta["cmap"],
+        zmin        = vmin,
+        zmax        = vmax,
+        colorbar    = dict(title=f"{meta['label']} ({meta['units']})", tickfont=dict(size=11)),
+        hoverongaps = False,
+        hovertemplate=f"Timestep: %{{x}}<br>Latitud aprox: %{{y:.1f}}°<br>{meta['label']}: %{{z:.3f}} {meta['units']}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Hovmöller — {meta['label']}</b><br><sup>Media zonal por latitud × timestep</sup>",
+            x=0.5, xanchor="center", font=dict(size=14, color="#dce8f0"),
+        ),
+        xaxis=dict(title="Timestep", tickangle=-45, color="#b0b0b0"),
+        yaxis=dict(title="Latitud aproximada (°)", ticksuffix="°", autorange="reversed", color="#b0b0b0"),
+        plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+        font=dict(color="#e0e0e0"),
+        height=480,
+        margin=dict(l=70, r=40, t=80, b=60),
+    )
+    return fig
+
 # ── Plot 6: Bubble Map — Wind Stress y Anomalía SST ──────────────────────────
 
 def create_bubble_windstress(
@@ -833,7 +896,7 @@ def create_bubble_windstress(
     sst    = sst[:min_h, :min_w]
 
     # ── Submuestreo para que el mapa sea legible (≈ 600 burbujas) ─────────
-    step = max(1, min_h // 25)
+    step = max(1, min_h // 15)
     wind_u_s = wind_u[::step, ::step]
     wind_v_s = wind_v[::step, ::step]
     sst_s    = sst[::step, ::step]
@@ -905,9 +968,8 @@ def create_bubble_windstress(
             bgcolor        = "#0e1117",
         ),
         coloraxis_colorbar=dict(
-            title     = "Anomalía SST (°C)",
-            tickfont  = dict(size=11, color="#e0e0e0"),
-            titlefont = dict(size=12, color="#e0e0e0"),
+            title    = "Anomalía SST (°C)",
+            tickfont = dict(size=11, color="#e0e0e0"),
         ),
         paper_bgcolor = "#0e1117",
         plot_bgcolor  = "#0e1117",
@@ -1291,6 +1353,12 @@ PLOT_REGISTRY: Dict[str, Dict[str, Any]] = {
         "label":       "🌬️ Wind Stress & SST Anomaly",
         "description": "Burbujas: tamaño = τ viento, color = anomalía SST",
     },
+
+    "hovmoller": {
+        "fn":          create_hovmoller,
+        "label":       "🌡️ Hovmöller Diagram",
+        "description": "Latitud × tiempo: media zonal para detectar propagación de anomalías",
+    },
     # ── TO ADD A NEW PLOT ────────────────────────────────────────────────────
     # "my_plot": {
     #     "fn":          create_my_plot,   # same signature as the others
@@ -1547,6 +1615,7 @@ def render_sidebar() -> Dict[str, Any]:
             "show_zonal_mean": False,
             "show_histogram":  False,
             "geos_face":       int(geos_face),
+            "show_hovmoller":  False,
             "show_bubble":     True,
             # Extend here for additional panel flags
         }
@@ -1961,8 +2030,8 @@ def main() -> None:
     secondary_panels: List[Tuple[bool, str]] = [
         (params["show_zonal_mean"], "zonal_mean"),
         (params["show_histogram"],  "histogram"),
+        (params["show_hovmoller"],  "hovmoller"),
         (params["show_bubble"],     "bubble_windstress"),
-        
         # ── TO ADD A NEW PANEL ─────────────────────────────────────────
         # (params["show_my_plot"], "my_plot"),
     ]
