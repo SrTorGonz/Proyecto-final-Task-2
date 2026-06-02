@@ -888,15 +888,18 @@ def create_bubble_windstress(
     if sst is None:
         sst = _generate_demo_slice("Theta", 0, lat_range, lon_range)
 
-    # ── Alinear dimensiones (recortar al mínimo común) ────────────────────
-    min_h = min(wind_u.shape[0], wind_v.shape[0], sst.shape[0])
-    min_w = min(wind_u.shape[1], wind_v.shape[1], sst.shape[1])
-    wind_u = wind_u[:min_h, :min_w]
-    wind_v = wind_v[:min_h, :min_w]
-    sst    = sst[:min_h, :min_w]
+   # ── Alinear dimensiones con resize al shape del viento ────────────────
+    target_h, target_w = wind_u.shape
+    def _resize(arr, h, w):
+        ri = np.linspace(0, arr.shape[0]-1, h, dtype=int)
+        ci = np.linspace(0, arr.shape[1]-1, w, dtype=int)
+        return arr[np.ix_(ri, ci)]
+
+    wind_v = _resize(wind_v, target_h, target_w)
+    sst    = _resize(sst,    target_h, target_w)
 
     # ── Submuestreo para que el mapa sea legible (≈ 600 burbujas) ─────────
-    step = max(1, min_h // 15)
+    step = max(1, target_h // 35)
     wind_u_s = wind_u[::step, ::step]
     wind_v_s = wind_v[::step, ::step]
     sst_s    = sst[::step, ::step]
@@ -938,17 +941,15 @@ def create_bubble_windstress(
         color      = anom_flat,
         color_continuous_scale = "RdBu_r",
         range_color= [-5, 5],
-        size_max   = 20,
-        opacity    = 0.7,
-        labels     = {"color": "Anomalía SST (°C)", "size": "Wind Stress τ"},
-        title      = (
-            "<b>Wind Stress → SST: Transferencia de Momentum Atmósfera–Océano</b><br>"
-            "<sup>Tamaño = τ (ρ·Cd·|V|²)  ·  Color = Anomalía de Temperatura Superficial</sup>"
-        ),
+        size_max   = 6,
+        opacity    = 0.80,
         projection = "natural earth",
     )
 
     fig.update_traces(
+        marker=dict(
+            line=dict(width=0),
+        ),
         hovertemplate=(
             "Lat: %{lat:.1f}°  Lon: %{lon:.1f}°<br>"
             "Anomalía SST: %{marker.color:.2f} °C<br>"
@@ -957,26 +958,45 @@ def create_bubble_windstress(
     )
 
     fig.update_layout(
+        title=dict(
+            text=(
+                "<b>Wind Stress → SST: Transferencia de Momentum Atmósfera–Océano</b><br>"
+                "<sup>Tamaño = τ (ρ·Cd·|V|²)  ·  Color = Anomalía de Temperatura Superficial del Mar</sup>"
+            ),
+            x=0.5, xanchor="center",
+            font=dict(size=14, color="#dce8f0"),
+        ),
         geo=dict(
-            showland       = True,
-            landcolor      = "#1a2030",
-            showocean      = True,
-            oceancolor     = "#0a1020",
-            showcoastlines = True,
-            coastlinecolor = "#334455",
-            showframe      = False,
-            bgcolor        = "#0e1117",
+            showland        = True,
+            landcolor       = "#1e2a3a",
+            showocean       = True,
+            oceancolor      = "#0a1628",
+            showcoastlines  = True,
+            coastlinecolor  = "#4a6fa5",
+            coastlinewidth  = 0.8,
+            showlakes       = True,
+            lakecolor       = "#0a1628",
+            showrivers      = False,
+            showframe       = False,
+            showcountries   = True,
+            countrycolor    = "#2a3f55",
+            countrywidth    = 0.4,
+            projection_type = "natural earth",
+            bgcolor         = "#0e1117",
+            lataxis         = dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+            lonaxis         = dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
         ),
         coloraxis_colorbar=dict(
             title    = "Anomalía SST (°C)",
             tickfont = dict(size=11, color="#e0e0e0"),
+            len      = 0.6,
+            thickness= 14,
+            x        = 1.01,
         ),
         paper_bgcolor = "#0e1117",
-        plot_bgcolor  = "#0e1117",
         font          = dict(color="#e0e0e0"),
-        title         = dict(x=0.5, xanchor="center", font=dict(size=13, color="#dce8f0")),
-        height        = 520,
-        margin        = dict(l=0, r=0, t=80, b=20),
+        height        = 560,
+        margin        = dict(l=0, r=80, t=80, b=10),
     )
     return fig
 
