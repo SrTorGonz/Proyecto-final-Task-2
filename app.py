@@ -1011,6 +1011,219 @@ def create_wind_rose(
     return fig
 
 
+
+# ── Plot 5: Hovmöller Diagram ─────────────────────────────────────────────────
+
+def create_hovmoller(
+    data:     np.ndarray,
+    lats:     np.ndarray,
+    lons:     np.ndarray,   # noqa: ARG001
+    variable: str,
+    title:    str,          # noqa: ARG001
+) -> go.Figure:
+    """Hovmöller diagram: heatmap latitud × tiempo con la media zonal de la variable seleccionada."""
+    meta     = VARIABLE_META.get(variable, VARIABLE_META["salt"])
+    lat_step = 4
+
+    timesteps_to_try = list(range(0, 10))
+    frames: List[Optional[np.ndarray]] = []
+
+    for t in timesteps_to_try:
+        arr = _disk_load_any_quality(variable, t, 0, face=0)
+        if arr is None:
+            arr = _generate_demo_slice(
+                variable, t,
+                lat_range=(lats[0] if len(lats) > 0 else -90, lats[-1] if len(lats) > 0 else 90),
+                lon_range=(-180, 180),
+            )
+        arr_sub    = arr[::lat_step, :]
+        zonal_mean = np.nanmean(_mask_fill(arr_sub), axis=1)
+        frames.append(zonal_mean)
+
+    ref_len = max((len(f) for f in frames if f is not None), default=1)
+    frames  = [f if f is not None else np.full(ref_len, np.nan) for f in frames]
+
+    matrix      = np.column_stack(frames)
+    lat_indices = np.arange(matrix.shape[0]) * lat_step - 90
+    time_labels = [f"t={t}" for t in timesteps_to_try]
+    vmin, vmax  = _get_clim(matrix, meta)
+
+    fig = go.Figure(go.Heatmap(
+        z           = matrix,
+        x           = time_labels,
+        y           = lat_indices,
+        colorscale  = meta["cmap"],
+        zmin        = vmin,
+        zmax        = vmax,
+        colorbar    = dict(title=f"{meta['label']} ({meta['units']})", tickfont=dict(size=11)),
+        hoverongaps = False,
+        hovertemplate=f"Timestep: %{{x}}<br>Latitud aprox: %{{y:.1f}}°<br>{meta['label']}: %{{z:.3f}} {meta['units']}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>Hovmöller — {meta['label']}</b><br><sup>Media zonal por latitud × timestep</sup>",
+            x=0.5, xanchor="center", font=dict(size=14, color="#dce8f0"),
+        ),
+        xaxis=dict(title="Timestep", tickangle=-45, color="#b0b0b0"),
+        yaxis=dict(title="Latitud aproximada (°)", ticksuffix="°", autorange="reversed", color="#b0b0b0"),
+        plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+        font=dict(color="#e0e0e0"),
+        height=480,
+        margin=dict(l=70, r=40, t=80, b=60),
+    )
+    return fig
+
+# ── Plot 6: Bubble Map — Wind Stress y Anomalía SST ──────────────────────────
+
+def create_bubble_windstress(
+    data:     np.ndarray,
+    lats:     np.ndarray,
+    lons:     np.ndarray,
+    variable: str,
+    title:    str,  # noqa: ARG001
+) -> go.Figure:
+    """
+    Mapa de burbujas geoespacial: tamaño = wind stress τ = ρ·Cd·|V|²
+    color = anomalía de SST (Theta - media global).
+    Muestra dónde el forzamiento atmosférico produce respuesta térmica oceánica.
+    """
+    import plotly.express as px
+
+    # ── Constantes físicas ────────────────────────────────────────────────
+    RHO_AIR = 1.225   # densidad del aire kg/m³
+    CD      = 1.3e-3  # coeficiente de arrastre adimensional (típico oceánico)
+
+    # ── Cargar vientos GEOS_U y GEOS_V desde disco ────────────────────────
+    wind_u = _disk_load_any_quality("GEOS_U", 0, 0, face=0)
+    wind_v = _disk_load_any_quality("GEOS_V", 0, 0, face=0)
+
+    # ── Cargar SST (Theta) desde disco ────────────────────────────────────
+    sst = _disk_load_any_quality("Theta", 0, 0, face=0)
+
+    # ── Fallback a datos sintéticos si no hay cache ───────────────────────
+    lat_range = (float(lats[0]), float(lats[-1])) if len(lats) > 1 else (-90.0, 90.0)
+    lon_range = (float(lons[0]), float(lons[-1])) if len(lons) > 1 else (-180.0, 180.0)
+
+    if wind_u is None:
+        wind_u = _generate_demo_slice("GEOS_U", 0, lat_range, lon_range)
+    if wind_v is None:
+        wind_v = _generate_demo_slice("GEOS_V", 0, lat_range, lon_range)
+    if sst is None:
+        sst = _generate_demo_slice("Theta", 0, lat_range, lon_range)
+
+   # ── Alinear dimensiones con resize al shape del viento ────────────────
+    target_h, target_w = wind_u.shape
+    def _resize(arr, h, w):
+        ri = np.linspace(0, arr.shape[0]-1, h, dtype=int)
+        ci = np.linspace(0, arr.shape[1]-1, w, dtype=int)
+        return arr[np.ix_(ri, ci)]
+
+    wind_v = _resize(wind_v, target_h, target_w)
+    sst    = _resize(sst,    target_h, target_w)
+
+    # ── Submuestreo para que el mapa sea legible (≈ 600 burbujas) ─────────
+    step = max(1, target_h // 35)
+    wind_u_s = wind_u[::step, ::step]
+    wind_v_s = wind_v[::step, ::step]
+    sst_s    = sst[::step, ::step]
+
+    ny, nx = wind_u_s.shape
+    lat_1d = np.linspace(lat_range[0], lat_range[1], ny)
+    lon_1d = np.linspace(lon_range[0], lon_range[1], nx)
+    lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
+
+    # ── Calcular wind stress τ = ρ · Cd · (U² + V²) ──────────────────────
+    speed_sq   = _mask_fill(wind_u_s)**2 + _mask_fill(wind_v_s)**2
+    tau        = RHO_AIR * CD * speed_sq          # N/m²
+
+    # ── Calcular anomalía de SST ──────────────────────────────────────────
+    sst_clean  = _mask_fill(sst_s)
+    sst_mean   = float(np.nanmean(sst_clean))
+    sst_anom   = sst_clean - sst_mean              # °C respecto a la media global
+
+    # ── Aplanar y filtrar NaN ─────────────────────────────────────────────
+    lat_flat  = lat_grid.ravel()
+    lon_flat  = lon_grid.ravel()
+    tau_flat  = tau.ravel()
+    anom_flat = sst_anom.ravel()
+
+    mask = np.isfinite(tau_flat) & np.isfinite(anom_flat) & (tau_flat > 0)
+    lat_flat  = lat_flat[mask]
+    lon_flat  = lon_flat[mask]
+    tau_flat  = tau_flat[mask]
+    anom_flat = anom_flat[mask]
+
+    # ── Normalizar tamaño de burbuja (0–40 px) ────────────────────────────
+    tau_norm = (tau_flat - tau_flat.min()) / (tau_flat.max() - tau_flat.min() + 1e-9)
+    size_px  = 4 + tau_norm * 36   # min 4, max 40
+
+    fig = px.scatter_geo(
+        lat        = lat_flat,
+        lon        = lon_flat,
+        size       = size_px,
+        color      = anom_flat,
+        color_continuous_scale = "RdBu_r",
+        range_color= [-5, 5],
+        size_max   = 12,
+        opacity    = 0.65,
+        projection = "natural earth",
+    )
+
+    fig.update_traces(
+        marker=dict(
+            line=dict(width=0),
+        ),
+        hovertemplate=(
+            "Lat: %{lat:.1f}°  Lon: %{lon:.1f}°<br>"
+            "Anomalía SST: %{marker.color:.2f} °C<br>"
+            "<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<b>Wind Stress → SST: Transferencia de Momentum Atmósfera–Océano</b><br>"
+                "<sup>Tamaño = τ (ρ·Cd·|V|²)  ·  Color = Anomalía de Temperatura Superficial del Mar</sup>"
+            ),
+            x=0.5, xanchor="center", xref="paper",
+            font=dict(size=14, color="#dce8f0"),
+        ),
+        geo=dict(
+            showland        = True,
+            landcolor       = "#1e2a3a",
+            showocean       = True,
+            oceancolor      = "#0a1628",
+            showcoastlines  = True,
+            coastlinecolor  = "#4a6fa5",
+            coastlinewidth  = 0.8,
+            showlakes       = True,
+            lakecolor       = "#0a1628",
+            showrivers      = False,
+            showframe       = False,
+            showcountries   = True,
+            countrycolor    = "#2a3f55",
+            countrywidth    = 0.4,
+            projection_type = "natural earth",
+            bgcolor         = "#0e1117",
+            lataxis         = dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+            lonaxis         = dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+        ),
+        coloraxis_colorbar=dict(
+            title    = "Anomalía SST (°C)",
+            tickfont = dict(size=11, color="#e0e0e0"),
+            len      = 0.6,
+            thickness= 14,
+            x        = 1.01,
+        ),
+        paper_bgcolor = "#0e1117",
+        font          = dict(color="#e0e0e0"),
+        height        = 560,
+        margin        = dict(l=0, r=80, t=80, b=10),
+    )
+    return fig
+
 # ── PLOT REGISTRY ─────────────────────────────────────────────────────────────
 # Maps string keys → callable plot factories with uniform signature:
 #   fn(data, lats, lons, variable, title) -> go.Figure
@@ -1379,6 +1592,17 @@ PLOT_REGISTRY: Dict[str, Dict[str, Any]] = {
         "label":       "Value Histogram",
         "description": "Distribution of field values in the current view",
     },
+    "bubble_windstress": {
+        "fn":          create_bubble_windstress,
+        "label":       "🌬️ Wind Stress & SST Anomaly",
+        "description": "Burbujas: tamaño = τ viento, color = anomalía SST",
+    },
+
+    "hovmoller": {
+        "fn":          create_hovmoller,
+        "label":       "🌡️ Hovmöller Diagram",
+        "description": "Latitud × tiempo: media zonal para detectar propagación de anomalías",
+    },
     "wind_rose": {
         "fn":          create_wind_rose,
         "label":       "🌬️ Rosa de Vientos",
@@ -1661,6 +1885,8 @@ def render_sidebar() -> Dict[str, Any]:
             "show_histogram":  False,
             "show_wind_rose":  show_wind_rose,
             "geos_face":       int(geos_face),
+            "show_hovmoller":  False,
+            "show_bubble":     True,
             # Extend here for additional panel flags
         }
 
@@ -2177,6 +2403,8 @@ def main() -> None:
     secondary_panels: List[Tuple[bool, str]] = [
         (params["show_zonal_mean"], "zonal_mean"),
         (params["show_histogram"],  "histogram"),
+        (params["show_hovmoller"],  "hovmoller"),
+        (params["show_bubble"],     "bubble_windstress"),
         # ── TO ADD A NEW PANEL ─────────────────────────────────────────
         # (params["show_my_plot"], "my_plot"),
     ]
