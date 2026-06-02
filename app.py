@@ -787,6 +787,137 @@ def create_histogram(
 # def create_time_comparison(data, lats, lons, variable, title):
 #     ...
 
+# ── Plot 6: Bubble Map — Wind Stress y Anomalía SST ──────────────────────────
+
+def create_bubble_windstress(
+    data:     np.ndarray,
+    lats:     np.ndarray,
+    lons:     np.ndarray,
+    variable: str,
+    title:    str,  # noqa: ARG001
+) -> go.Figure:
+    """
+    Mapa de burbujas geoespacial: tamaño = wind stress τ = ρ·Cd·|V|²
+    color = anomalía de SST (Theta - media global).
+    Muestra dónde el forzamiento atmosférico produce respuesta térmica oceánica.
+    """
+    import plotly.express as px
+
+    # ── Constantes físicas ────────────────────────────────────────────────
+    RHO_AIR = 1.225   # densidad del aire kg/m³
+    CD      = 1.3e-3  # coeficiente de arrastre adimensional (típico oceánico)
+
+    # ── Cargar vientos GEOS_U y GEOS_V desde disco ────────────────────────
+    wind_u = _disk_load_any_quality("GEOS_U", 0, 0, face=0)
+    wind_v = _disk_load_any_quality("GEOS_V", 0, 0, face=0)
+
+    # ── Cargar SST (Theta) desde disco ────────────────────────────────────
+    sst = _disk_load_any_quality("Theta", 0, 0, face=0)
+
+    # ── Fallback a datos sintéticos si no hay cache ───────────────────────
+    lat_range = (float(lats[0]), float(lats[-1])) if len(lats) > 1 else (-90.0, 90.0)
+    lon_range = (float(lons[0]), float(lons[-1])) if len(lons) > 1 else (-180.0, 180.0)
+
+    if wind_u is None:
+        wind_u = _generate_demo_slice("GEOS_U", 0, lat_range, lon_range)
+    if wind_v is None:
+        wind_v = _generate_demo_slice("GEOS_V", 0, lat_range, lon_range)
+    if sst is None:
+        sst = _generate_demo_slice("Theta", 0, lat_range, lon_range)
+
+    # ── Alinear dimensiones (recortar al mínimo común) ────────────────────
+    min_h = min(wind_u.shape[0], wind_v.shape[0], sst.shape[0])
+    min_w = min(wind_u.shape[1], wind_v.shape[1], sst.shape[1])
+    wind_u = wind_u[:min_h, :min_w]
+    wind_v = wind_v[:min_h, :min_w]
+    sst    = sst[:min_h, :min_w]
+
+    # ── Submuestreo para que el mapa sea legible (≈ 600 burbujas) ─────────
+    step = max(1, min_h // 25)
+    wind_u_s = wind_u[::step, ::step]
+    wind_v_s = wind_v[::step, ::step]
+    sst_s    = sst[::step, ::step]
+
+    ny, nx = wind_u_s.shape
+    lat_1d = np.linspace(lat_range[0], lat_range[1], ny)
+    lon_1d = np.linspace(lon_range[0], lon_range[1], nx)
+    lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
+
+    # ── Calcular wind stress τ = ρ · Cd · (U² + V²) ──────────────────────
+    speed_sq   = _mask_fill(wind_u_s)**2 + _mask_fill(wind_v_s)**2
+    tau        = RHO_AIR * CD * speed_sq          # N/m²
+
+    # ── Calcular anomalía de SST ──────────────────────────────────────────
+    sst_clean  = _mask_fill(sst_s)
+    sst_mean   = float(np.nanmean(sst_clean))
+    sst_anom   = sst_clean - sst_mean              # °C respecto a la media global
+
+    # ── Aplanar y filtrar NaN ─────────────────────────────────────────────
+    lat_flat  = lat_grid.ravel()
+    lon_flat  = lon_grid.ravel()
+    tau_flat  = tau.ravel()
+    anom_flat = sst_anom.ravel()
+
+    mask = np.isfinite(tau_flat) & np.isfinite(anom_flat) & (tau_flat > 0)
+    lat_flat  = lat_flat[mask]
+    lon_flat  = lon_flat[mask]
+    tau_flat  = tau_flat[mask]
+    anom_flat = anom_flat[mask]
+
+    # ── Normalizar tamaño de burbuja (0–40 px) ────────────────────────────
+    tau_norm = (tau_flat - tau_flat.min()) / (tau_flat.max() - tau_flat.min() + 1e-9)
+    size_px  = 4 + tau_norm * 36   # min 4, max 40
+
+    fig = px.scatter_geo(
+        lat        = lat_flat,
+        lon        = lon_flat,
+        size       = size_px,
+        color      = anom_flat,
+        color_continuous_scale = "RdBu_r",
+        range_color= [-5, 5],
+        size_max   = 20,
+        opacity    = 0.7,
+        labels     = {"color": "Anomalía SST (°C)", "size": "Wind Stress τ"},
+        title      = (
+            "<b>Wind Stress → SST: Transferencia de Momentum Atmósfera–Océano</b><br>"
+            "<sup>Tamaño = τ (ρ·Cd·|V|²)  ·  Color = Anomalía de Temperatura Superficial</sup>"
+        ),
+        projection = "natural earth",
+    )
+
+    fig.update_traces(
+        hovertemplate=(
+            "Lat: %{lat:.1f}°  Lon: %{lon:.1f}°<br>"
+            "Anomalía SST: %{marker.color:.2f} °C<br>"
+            "<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        geo=dict(
+            showland       = True,
+            landcolor      = "#1a2030",
+            showocean      = True,
+            oceancolor     = "#0a1020",
+            showcoastlines = True,
+            coastlinecolor = "#334455",
+            showframe      = False,
+            bgcolor        = "#0e1117",
+        ),
+        coloraxis_colorbar=dict(
+            title     = "Anomalía SST (°C)",
+            tickfont  = dict(size=11, color="#e0e0e0"),
+            titlefont = dict(size=12, color="#e0e0e0"),
+        ),
+        paper_bgcolor = "#0e1117",
+        plot_bgcolor  = "#0e1117",
+        font          = dict(color="#e0e0e0"),
+        title         = dict(x=0.5, xanchor="center", font=dict(size=13, color="#dce8f0")),
+        height        = 520,
+        margin        = dict(l=0, r=0, t=80, b=20),
+    )
+    return fig
+
 # ── PLOT REGISTRY ─────────────────────────────────────────────────────────────
 # Maps string keys → callable plot factories with uniform signature:
 #   fn(data, lats, lons, variable, title) -> go.Figure
@@ -1155,6 +1286,11 @@ PLOT_REGISTRY: Dict[str, Dict[str, Any]] = {
         "label":       "Value Histogram",
         "description": "Distribution of field values in the current view",
     },
+    "bubble_windstress": {
+        "fn":          create_bubble_windstress,
+        "label":       "🌬️ Wind Stress & SST Anomaly",
+        "description": "Burbujas: tamaño = τ viento, color = anomalía SST",
+    },
     # ── TO ADD A NEW PLOT ────────────────────────────────────────────────────
     # "my_plot": {
     #     "fn":          create_my_plot,   # same signature as the others
@@ -1411,6 +1547,7 @@ def render_sidebar() -> Dict[str, Any]:
             "show_zonal_mean": False,
             "show_histogram":  False,
             "geos_face":       int(geos_face),
+            "show_bubble":     True,
             # Extend here for additional panel flags
         }
 
@@ -1824,6 +1961,8 @@ def main() -> None:
     secondary_panels: List[Tuple[bool, str]] = [
         (params["show_zonal_mean"], "zonal_mean"),
         (params["show_histogram"],  "histogram"),
+        (params["show_bubble"],     "bubble_windstress"),
+        
         # ── TO ADD A NEW PANEL ─────────────────────────────────────────
         # (params["show_my_plot"], "my_plot"),
     ]
