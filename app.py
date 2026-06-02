@@ -941,8 +941,8 @@ def create_bubble_windstress(
         color      = anom_flat,
         color_continuous_scale = "RdBu_r",
         range_color= [-5, 5],
-        size_max   = 6,
-        opacity    = 0.80,
+        size_max   = 12,
+        opacity    = 0.65,
         projection = "natural earth",
     )
 
@@ -963,7 +963,7 @@ def create_bubble_windstress(
                 "<b>Wind Stress → SST: Transferencia de Momentum Atmósfera–Océano</b><br>"
                 "<sup>Tamaño = τ (ρ·Cd·|V|²)  ·  Color = Anomalía de Temperatura Superficial del Mar</sup>"
             ),
-            x=0.5, xanchor="center",
+            x=0.5, xanchor="center", xref="paper",
             font=dict(size=14, color="#dce8f0"),
         ),
         geo=dict(
