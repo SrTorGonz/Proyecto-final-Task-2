@@ -787,6 +787,230 @@ def create_histogram(
 # def create_time_comparison(data, lats, lons, variable, title):
 #     ...
 
+
+# ── Plot 5: Wind Rose — Polar Directional Distribution ───────────────────────
+
+def create_wind_rose(
+    data:     np.ndarray,   # noqa: ARG001 — uniform signature; not used here
+    lats:     np.ndarray,   # noqa: ARG001
+    lons:     np.ndarray,   # noqa: ARG001
+    variable: str,          # noqa: ARG001
+    title:    str,          # noqa: ARG001
+) -> go.Figure:
+    """
+    Polar bar chart (Rosa de Vientos) showing the directional distribution
+    of GEOS atmospheric winds (U, V components).
+
+    Data source
+    -----------
+    wind_u : GEOS_U — zonal (east-west) wind component [m/s]
+    wind_v : GEOS_V — meridional (north-south) wind component [m/s]
+
+    Both arrays are retrieved from ``st.session_state`` where they were
+    stored by ``main()`` immediately after the fetch-and-fallback block
+    (step 8).  This avoids re-downloading the data and keeps the function
+    signature uniform with all other plot factories.
+
+    Methodology
+    -----------
+    * Direction is computed as the meteorological bearing — the compass
+      direction FROM which the wind blows (0° = from North, 90° = from East,
+      clockwise).  Formula: ``atan2(U, V) + 180°``
+    * The compass is divided into 16 sectors of 22.5° each.
+    * Wind speed is binned into four classes so each sector shows a stacked
+      bar whose height equals the percentage of observations in that class
+      and direction — a standard wind rose convention.
+    * go.Barpolar is used with ``barmode="stack"`` so classes stack cleanly.
+
+    Justification for SciVis 2026 Task 2
+    -------------------------------------
+    The wind rose statistically summarises the surface wind regime of the
+    selected geographic region at the chosen timestep.  Comparing it with
+    the quiver map of ocean currents allows the analyst to assess
+    wind-driven circulation patterns, Ekman transport directions, and the
+    alignment (or divergence) between atmospheric forcing and oceanic
+    response — a key diagnostic for the Atmospheric-Ocean Systems task.
+
+    No extra cache files are needed: the GEOS_U and GEOS_V slices are
+    already downloaded and cached by ``fetch_ocean_slice()`` / ``_disk_save()``
+    before this function is called.
+    """
+    wind_u: Optional[np.ndarray] = st.session_state.get("_wind_rose_u")
+    wind_v: Optional[np.ndarray] = st.session_state.get("_wind_rose_v")
+
+    # ── Guard: no wind data available yet ────────────────────────────────────
+    if wind_u is None or wind_v is None:
+        fig = go.Figure()
+        fig.update_layout(
+            title=dict(
+                text="<b>Rosa de Vientos</b><br><sup>Sin datos de viento disponibles aún</sup>",
+                x=0.5, xanchor="center", font=dict(size=12, color="#e0e0e0"),
+            ),
+            paper_bgcolor="#0e1117",
+            font=dict(color="#e0e0e0"),
+            height=420,
+            margin=dict(l=40, r=40, t=70, b=40),
+        )
+        return fig
+
+    # ── Flatten and clean ─────────────────────────────────────────────────────
+    u = _mask_fill(wind_u).ravel()
+    v = _mask_fill(wind_v).ravel()
+    valid_mask = np.isfinite(u) & np.isfinite(v)
+    u = u[valid_mask]
+    v = v[valid_mask]
+
+    if u.size == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            title=dict(
+                text="<b>Rosa de Vientos</b><br><sup>Todos los valores son NaN en esta región</sup>",
+                x=0.5, xanchor="center", font=dict(size=12, color="#e0e0e0"),
+            ),
+            paper_bgcolor="#0e1117",
+            font=dict(color="#e0e0e0"),
+            height=420,
+        )
+        return fig
+
+    # ── Compute meteorological bearing and speed ──────────────────────────────
+    # Bearing = direction FROM which wind comes (meteorological convention)
+    # atan2(U, V) gives direction the wind is GOING → add 180° to flip
+    speed     = np.sqrt(u ** 2 + v ** 2)
+    direction = (np.degrees(np.arctan2(u, v)) + 180.0) % 360.0  # 0° = from N
+
+    # ── Directional bins (16 sectors × 22.5°) ────────────────────────────────
+    n_sectors  = 16
+    sector_deg = 360.0 / n_sectors
+    # Bin edges offset by half a sector so 0° (N) is centred on the first bin
+    bin_edges  = np.arange(-sector_deg / 2, 360.0 + sector_deg / 2, sector_deg)
+    # Assign each observation to a sector; wrap last bin back to first
+    bin_idx    = np.digitize(direction, bin_edges) - 1
+    bin_idx    = np.where(bin_idx == n_sectors, 0, bin_idx)  # wrap 360° → 0°
+
+    sector_centers = [i * sector_deg for i in range(n_sectors)]
+    sector_labels  = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+                      "S","SSO","SO","OSO","O","ONO","NO","NNO"]
+
+    # ── Speed classes (m/s) ───────────────────────────────────────────────────
+    speed_classes = [
+        (0,   5,  "0–5 m/s",   "#42a5f5"),   # calm — deep blue (bright contrast)
+        (5,  10,  "5–10 m/s",  "#1565c0"),   # moderate — blue (darker royal blue)
+        (10, 20,  "10–20 m/s", "#ff9800"),   # strong — amber
+        (20, 999, ">20 m/s",   "#f44336"),   # storm — red
+    ]
+
+    total_obs = max(u.size, 1)
+    fig = go.Figure()
+
+    for lo, hi, label_cls, color in speed_classes:
+        class_mask = (speed >= lo) & (speed < hi)
+        freq_pct   = np.zeros(n_sectors, dtype=float)
+
+        for s in range(n_sectors):
+            sector_mask    = bin_idx == s
+            freq_pct[s]    = np.sum(class_mask & sector_mask) / total_obs * 100.0
+
+        # Close the polar loop: repeat first value at end so Plotly fills fully
+        r_vals     = list(freq_pct) + [freq_pct[0]]
+        theta_vals = sector_centers + [sector_centers[0]]
+
+        fig.add_trace(go.Barpolar(
+            r=r_vals,
+            theta=theta_vals,
+            width=[sector_deg] * (n_sectors + 1),
+            name=label_cls,
+            marker_color=color,
+            marker_line_color="rgba(0,0,0,0.25)",
+            marker_line_width=0.6,
+            opacity=1.0,
+            hovertemplate=(
+                "<b>%{theta:.1f}°</b><br>"
+                f"{label_cls}<br>"
+                "Frecuencia: %{r:.2f}%<extra></extra>"
+            ),
+        ))
+
+    # ── Summary statistics for subtitle ──────────────────────────────────────
+    dominant_idx   = int(np.argmax(
+        [np.sum(bin_idx == s) for s in range(n_sectors)]
+    ))
+    dominant_label = sector_labels[dominant_idx]
+    mean_speed     = float(np.nanmean(speed))
+    p95_speed      = float(np.nanpercentile(speed, 95))
+    n_pts          = u.size
+
+    # Read zoom and rotation directly from widget keys (single source of truth)
+    # Defaults: 40% scale, 90° rotation (North at top)
+    max_range = float(st.session_state.get("wind_rose_slider", 40))
+    rotation  = int(st.session_state.get("wind_rose_rot_slider", 90))
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                "<span style='font-size: 16px; font-weight: bold; color: #ffffff;'>"
+                "Rosa de Vientos GEOS — Distribución Direccional</span><br>"
+                "<span style='font-size: 12px; color: #b0c8d8; font-weight: normal;'>"
+                f"Componentes U (zonal) y V (meridional)  ·  "
+                f"Dir. dominante: <b>{dominant_label}</b>  ·  "
+                f"Vel. media: {mean_speed:.1f} m/s  ·  "
+                f"P95: {p95_speed:.1f} m/s  ·  n={n_pts:,}</span>"
+            ),
+            x=0.5, xanchor="center",
+            font=dict(color="#ffffff"),
+        ),
+        polar=dict(
+            bgcolor="#07101e",
+            radialaxis=dict(
+                ticksuffix="%",
+                tickfont=dict(size=11, color="#b0c8d8"),
+                gridcolor="rgba(255,255,255,0.08)",
+                linecolor="rgba(255,255,255,0.08)",
+                angle=90,
+                tickangle=90,
+                range=[-1, max_range],
+            ),
+            angularaxis=dict(
+                tickmode="array",
+                tickvals=sector_centers,
+                ticktext=sector_labels,
+                direction="clockwise",
+                rotation=rotation,     # controlled via session_state
+                tickfont=dict(size=11, color="#b0c8d8"),
+                gridcolor="rgba(255,255,255,0.08)",
+                linecolor="rgba(255,255,255,0.15)",
+            ),
+        ),
+        barmode="stack",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=-0.25,
+            xanchor="center", x=0.5,
+            font=dict(size=13, color="#ffffff"),
+            bgcolor="rgba(7,16,30,0.85)",
+            bordercolor="rgba(90,127,160,0.3)", borderwidth=1,
+        ),
+        dragmode="pan",
+        paper_bgcolor="#0e1117",
+        font=dict(color="#dce8f0"),
+        height=600,
+        margin=dict(l=40, r=40, t=95, b=95),
+        annotations=[
+            dict(
+                text=(
+                    "Convención meteorológica: dirección <i>de donde viene</i> el viento  ·  "
+                    "16 sectores de 22.5°  ·  Datos: GEOS U,V"
+                ),
+                x=0.5, y=-0.13, xref="paper", yref="paper",
+                showarrow=False,
+                font=dict(size=11, color="#b0c8d8"),
+                align="center",
+            ),
+        ],
+    )
+    return fig
+
+
 # ── PLOT REGISTRY ─────────────────────────────────────────────────────────────
 # Maps string keys → callable plot factories with uniform signature:
 #   fn(data, lats, lons, variable, title) -> go.Figure
@@ -1155,6 +1379,11 @@ PLOT_REGISTRY: Dict[str, Dict[str, Any]] = {
         "label":       "Value Histogram",
         "description": "Distribution of field values in the current view",
     },
+    "wind_rose": {
+        "fn":          create_wind_rose,
+        "label":       "🌬️ Rosa de Vientos",
+        "description": "Histograma polar: frecuencia y magnitud del viento GEOS por dirección (U, V)",
+    },
     # ── TO ADD A NEW PLOT ────────────────────────────────────────────────────
     # "my_plot": {
     #     "fn":          create_my_plot,   # same signature as the others
@@ -1191,7 +1420,16 @@ def render_plot_box(
 
     try:
         fig = entry["fn"](data, lats, lons, variable, title)
-        st.plotly_chart(fig, width="stretch")
+        if key == "wind_rose":
+            config = {
+                "scrollZoom": True,
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": ["toImage", "sendDataToCloud"],
+                "displaylogo": False,
+            }
+        else:
+            config = None
+        st.plotly_chart(fig, width="stretch", config=config)
     except Exception:
         st.error(f"Rendering '{entry['label']}' failed.")
         st.code(traceback.format_exc())
@@ -1392,6 +1630,17 @@ def render_sidebar() -> Dict[str, Any]:
         except Exception:
             pass
         st.markdown("---")
+        st.markdown("### Gráficas adicionales")
+        show_wind_rose = st.checkbox(
+            "🌬️ Rosa de Vientos",
+            value=True,
+            help=(
+                "Histograma polar (go.Barpolar) que muestra frecuencia y magnitud "
+                "del viento GEOS por dirección (U, V). "
+                "Util para comparar el regimen de vientos con las corrientes oceanicas."
+            ),
+        )
+        st.markdown("---")
         st.caption(
             "**Data:** NASA DYAMOND LLC2160  \n"
             "**Access:** OpenVisus / NSDF  \n"
@@ -1410,6 +1659,7 @@ def render_sidebar() -> Dict[str, Any]:
             "quality_key":     quality_key,
             "show_zonal_mean": False,
             "show_histogram":  False,
+            "show_wind_rose":  show_wind_rose,
             "geos_face":       int(geos_face),
             # Extend here for additional panel flags
         }
@@ -1807,6 +2057,13 @@ def main() -> None:
         if ocean_mask_source is None:
             ocean_mask_source = _generate_demo_slice("salt", current_timestep, (params["lat_min"], params["lat_max"]), (params["lon_min"], params["lon_max"]))
 
+        # Persistir wind_u/wind_v para la rosa de vientos
+        # Se guardan despues de los fallbacks: nunca son None en este punto.
+        # No se necesitan .npz extra: fetch_ocean_slice() ya guardo
+        # automaticamente los slices GEOS_U y GEOS_V en _SLICE_DIR.
+        st.session_state["_wind_rose_u"] = wind_u
+        st.session_state["_wind_rose_v"] = wind_v
+
     st.plotly_chart(
         create_wind_current_quiver(
             wind_u=wind_u,
@@ -1820,6 +2077,102 @@ def main() -> None:
         ),
         width="stretch",
     )
+
+    # ── 8b. Rosa de Vientos (siempre visible debajo del mapa de quiver) ─
+    # Se muestra siempre porque los datos de viento ya fueron descargados
+    # en el bloque anterior. El checkbox del sidebar permite ocultarla.
+    if params.get("show_wind_rose", True):
+        st.markdown(
+            "<hr style='border:none;border-top:1px solid rgba(0,212,255,0.2);margin:10px 0 6px;'/>",
+            unsafe_allow_html=True,
+        )
+        
+        # ── Inicializar valores por defecto en los widget-keys la primera vez ──
+        if "wind_rose_slider" not in st.session_state:
+            st.session_state["wind_rose_slider"] = 40
+        if "wind_rose_rot_slider" not in st.session_state:
+            st.session_state["wind_rose_rot_slider"] = 90
+
+        # ── Fila 1: Zoom de escala radial ──
+        st.markdown(
+            "<p style='color:#b0c8d8;font-size:0.82rem;margin:4px 0 2px;'>"
+            "<b>Zoom</b></p>",
+            unsafe_allow_html=True,
+        )
+        col_z1, col_z2, col_z3, col_z4 = st.columns([0.6, 0.6, 0.6, 4])
+        with col_z1:
+            if st.button("➕", help="Acercar: reduce el rango radial en 5%", use_container_width=True):
+                # Update the widget key directly — slider stays in sync
+                st.session_state["wind_rose_slider"] = max(5, st.session_state["wind_rose_slider"] - 5)
+                st.rerun()
+        with col_z2:
+            if st.button("➖", help="Alejar: amplía el rango radial en 5%", use_container_width=True):
+                st.session_state["wind_rose_slider"] = min(100, st.session_state["wind_rose_slider"] + 5)
+                st.rerun()
+        with col_z3:
+            if st.button("↺", help="Restablecer zoom (40%)", use_container_width=True):
+                st.session_state["wind_rose_slider"] = 40
+                st.rerun()
+        with col_z4:
+            # Slider is the source of truth — no extra comparison needed
+            st.slider(
+                "Escala radial",
+                min_value=5, max_value=100,
+                step=5,
+                format="%d%%",
+                label_visibility="collapsed",
+                key="wind_rose_slider",
+            )
+
+        # ── Fila 2: Rotación (paneo angular) ──
+        st.markdown(
+            "<p style='color:#b0c8d8;font-size:0.82rem;margin:6px 0 2px;'>"
+            "<b>Rotación </b> "
+            "<span style='color:#8ab4cc;font-size:0.78rem;'>"
+            "</span></p>",
+            unsafe_allow_html=True,
+        )
+        col_r1, col_r2, col_r3, col_r4 = st.columns([0.6, 0.6, 0.6, 4])
+        with col_r1:
+            if st.button("◀", help="Rotar 22.5° antihorario", use_container_width=True):
+                st.session_state["wind_rose_rot_slider"] = (st.session_state["wind_rose_rot_slider"] + 22) % 360
+                st.rerun()
+        with col_r2:
+            if st.button("▶", help="Rotar 22.5° horario", use_container_width=True):
+                st.session_state["wind_rose_rot_slider"] = (st.session_state["wind_rose_rot_slider"] - 22) % 360
+                st.rerun()
+        with col_r3:
+            if st.button("⬆", help="Restablecer Norte arriba", use_container_width=True):
+                st.session_state["wind_rose_rot_slider"] = 90
+                st.rerun()
+        with col_r4:
+            # Slider is the source of truth — no extra comparison needed
+            st.slider(
+                "Rotación angular",
+                min_value=0, max_value=359,
+                step=1,
+                format="%d°",
+                label_visibility="collapsed",
+                key="wind_rose_rot_slider",
+            )
+
+        st.markdown(
+            f"<p style='color:#506070;font-size:0.8rem;margin:2px 0 6px;'>"
+            f"Escala: <b>0%–{st.session_state['wind_rose_slider']}%</b> &nbsp;·&nbsp; "
+            f"Rotación: <b>{st.session_state['wind_rose_rot_slider']}°</b> "
+            f"(90° = Norte arriba)"
+            f"</p>",
+            unsafe_allow_html=True,
+        )
+
+        render_plot_box(
+            key      = "wind_rose",
+            data     = data,
+            lats     = lats,
+            lons     = lons,
+            variable = params["variable"],
+            title    = title,
+        )
 
     secondary_panels: List[Tuple[bool, str]] = [
         (params["show_zonal_mean"], "zonal_mean"),
